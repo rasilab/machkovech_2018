@@ -5,7 +5,7 @@
 - [[file:figures/][figures]] contains all main and supplemental figures generated from analysis
 
 
-_Analysis Steps_
+* Analysis Steps
 
 All =.Rmd= scripts below should be called from within R or with the =R -e= switch from the command line.
 
