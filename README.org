@@ -1,0 +1,81 @@
+#+TITLE: Code for data analysis and reproduction of figures
+
+- [[file:scripts/][scripts]] contains all the data analysis code
+- [[file:tables/][tables]] contains all summary tables generated from analysis 
+- [[file:figures/][figures]] contains all main and supplemental figures generated from analysis
+
+
+_Analysis Steps_
+
+All =.Rmd= scripts below should be called from within R or with the =R -e= switch from the command line.
+
+** Trim reads, discard rRNA-aligning reads and align rest to human and flu genomes
+Example of a single sample is shown.
+Run as a loop to process all samples, or run it as separate jobs on a cluster.
+#+BEGIN_SRC sh :exports code
+Makefile SAMPLE=ltm_untr
+#+END_SRC
+
+** Calculate coverage at each genomic position
+Single example is shown. 
+Run this with the reference genome as either =gencode= or =flu=, strand as either =plus= or =minus==, and the sample name of one of the 12 samples in this study.
+=genome= is just an extra variable that can also be set to =transcript= to get coverage along transcripts (not used).
+#+BEGIN_SRC sh :exports code
+# for Ribo-seq or Ribo-seq + LTM samples
+Rscript calculate_coverage.R ltm_untr gencode genome plus
+# for mRNA samples
+Rscript calculate_coverage_mrna.R mrna_untr gencode genome plus
+#+END_SRC
+
+** Calculate metagene profile at start and stop codons
+#+BEGIN_SRC R :exports code
+rmarkdown::render('analyze_flu_called_start_sites.Rmd')
+rmarkdown::render('analyze_host_called_start_sites.Rmd')
+#+END_SRC
+
+** Plot statistics of various read pre-processing steps until alignment
+#+BEGIN_SRC R :exports code
+rmarkdown::render('plot_read_preprocessing_stats.Rmd')
+#+END_SRC
+
+** Plot statistics of aligned reads
+#+BEGIN_SRC R :exports code
+rmarkdown::render('plot_alignment_stats.Rmd')
+#+END_SRC
+
+** Find alignment to different NP variants
+Example for a single sample is shown.
+#+BEGIN_SRC sh :exports code
+Rscript find_np_alignments.R ltm_vir
+#+END_SRC
+
+** Plot NP alignment statistics 
+#+BEGIN_SRC R :exports code
+rmarkdown::render('analyze_np_ctg.Rmd')
+#+END_SRC
+
+** Pool counts at neighboring sites for calling start sites
+Example for a single sample, strand, and reference is shown.  Do this spe
+Run this with the reference genome as either =gencode= or =flu=, strand as either =plus= or =minus==, and the sample name of one of the Ribo-seq or Ribo-seq + LTM samples in this study.
+This script uses the coverage files calculated above as input.
+#+BEGIN_SRC sh :exports code
+Rscript pool_neighbors.R coverage/gencode/ltm_vir.gencode.plus.genome.tsv.gz
+#+END_SRC
+
+** Call start sites on flu and host transcripts
+#+BEGIN_SRC R :exports code
+rmarkdown::render('call_flu_start_sites.Rmd')
+rmarkdown::render('call_host_start_sites.Rmd')
+#+END_SRC
+
+** Annotate the called start sites on transcripts and plot basic summary statistics
+#+BEGIN_SRC R :exports code
+rmarkdown::render('analyze_flu_called_start_sites.Rmd')
+rmarkdown::render('analyze_host_called_start_sites.Rmd')
+#+END_SRC
+
+** Plot statistics of the called start sites on flu and host transcripts 
+#+BEGIN_SRC R :exports code
+rmarkdown::render('plot_flu_called_start_stats.Rmd')
+rmarkdown::render('plot_host_called_start_stats.Rmd')
+#+END_SRC
