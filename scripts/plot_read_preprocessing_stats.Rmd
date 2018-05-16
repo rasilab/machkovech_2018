@@ -1,0 +1,264 @@
+---
+title: "Plot stats for various read preprocessing steps"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=F}
+# for string concatenation
+library(glue)
+# for string analysis
+library(stringr)
+# for reading annotation and coverage file formats
+library(rtracklayer)
+# for handling htseq alignments
+library(GenomicAlignments)
+# for handling genomic annotations
+library(GenomicFeatures)
+# for sampling from alignment files
+library(GenomicFiles)
+# for converting between bioconductor aGnd tidyverse
+library(biobroom)
+# for biconductor tidyverse interface
+library(plyranges)
+# for munging data
+library(tidyverse)
+```
+
+## Plotting defaults
+```{r, message=F}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", 
+    "#D55E00", "#F0E442")
+
+theme_set(theme_bw(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8),
+  axis.line = element_line(size=.25),
+  plot.title = element_text(size = 8, hjust = 0.5)
+))
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+
+min_read_length_cutoff <- 20
+```
+
+## Extract trimming statistics
+```{r, fig.width=1.6, fig.height=2.4}
+trim_stats <- list.files("../processeddata/", recursive = T,
+                   full.names = T) %>% 
+  # get log files 
+  str_subset("trim.fq.log") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "(?<=processeddata/{1,2})[^/]+")) %>% 
+  # read file contents
+  map(read_file) %>% 
+  # convert listcol to stringcol
+  unlist() %>% 
+  # convert to tibble with nice col names
+  enframe("sample", "data") %>% 
+  # extract input reads 
+  mutate(input_reads = str_extract(data, "(?<=Total reads processed:\\s{1,20})[^\\s]+")) %>% 
+  # extract reads with adapters that pass length filter
+  mutate(trimmed_reads = str_extract(data, "(?<=filters\\):\\s{1,20})[^\\s]+")) %>% 
+  # convert extracted columns to numbers
+  type_convert() %>% 
+  mutate(trimmed_reads = trimmed_reads / 1e6,
+         input_reads = input_reads / 1e6) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  print()
+  
+trim_stats %>%
+  ggplot(aes(x = sample , y = input_reads, color = treatment)) +
+  theme(strip.placement = "outside") +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_color_manual(values = cbPalette) +
+  labs(y = "total reads (× 10⁶)\n", x = "", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "vertical",
+        legend.box.margin = margin(l = 0)) +
+  scale_y_continuous(position = "top", limits = c(0, NA), breaks = scales::pretty_breaks(n=3))
+
+ggsave("../figures/input_read_count.pdf", device = cairo_pdf)
+
+trim_stats %>%
+  # filter(treatment != "mRNA") %>% 
+  ggplot(aes(x = sample , y = trimmed_reads, color = treatment)) +
+  theme(strip.placement = "outside") +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_color_manual(values = cbPalette[2:3]) +
+  labs(y = "trimmed reads (× 10⁶)\n", x = "", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "vertical",
+        legend.box.margin = margin(l = 0)) +
+  scale_y_continuous(position = "top", limits = c(0, NA), breaks = scales::pretty_breaks(n=3))
+
+ggsave("../figures/trimming_stats.pdf", device = cairo_pdf)
+```
+
+## Extract rRNA subtraction statistics
+```{r, fig.width=1.6, fig.height=2.4}
+rrna_stats <- list.files("../processeddata/", recursive = T,
+                   full.names = T) %>% 
+  # get log files 
+  str_subset("norrna.fq.log") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "(?<=processeddata/{1,2})[^/]+")) %>% 
+  # read file contents
+  map(read_file) %>% 
+  # convert listcol to stringcol
+  unlist() %>% 
+  # convert to tibble with nice col names
+  enframe("sample", "data") %>% 
+  # extract total reads 
+  mutate(input_reads = str_extract(data, "(?<=reads processed:\\s{1,20})[^\\s]+")) %>% 
+  # extract reads with adapters that pass length filter
+  mutate(rrna_reads = str_extract(data, "(?<=at least one reported alignment:\\s{1,20})[^\\s]+")) %>% 
+  # convert extracted columns to numbers
+  type_convert() %>% 
+  mutate(rrna_reads = rrna_reads / 1e6,
+         input_reads = input_reads / 1e6) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  print()
+  
+rrna_stats %>%
+  ggplot(aes(x = sample , y = rrna_reads, color = treatment)) +
+  theme(strip.placement = "outside") +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_color_manual(values = cbPalette[1:3]) +
+  labs(y = "reads aligning\nto rRNA(× 10⁶)", x = "", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "vertical",
+        legend.box.margin = margin(l = 0)) +
+  scale_y_continuous(position = "top", limits = c(0, NA), breaks = scales::pretty_breaks(n=3))
+
+ggsave("../figures/rrna_subraction_stats.pdf", device = cairo_pdf)
+
+```
+
+
+## Extract gencode alignment statistics
+```{r, fig.width=1.6, fig.height=2.4}
+gencode_stats <- list.files("../processeddata/", recursive = T,
+                   full.names = T) %>% 
+  # get log files 
+  str_subset("gencode.log") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "(?<=processeddata/{1,2})[^/]+")) %>% 
+  # read file contents
+  map(read_file) %>% 
+  # convert listcol to stringcol
+  unlist() %>% 
+  # convert to tibble with nice col names
+  enframe("sample", "data") %>% 
+  # extract total reads
+  mutate(input_reads = str_extract(data, "(?<=reads processed:\\s{1,20})[^\\s]+")) %>%
+  # extract reads with adapters that pass length filter
+  mutate(gencode_reads = str_extract(data, "(?<=at least one reported alignment:\\s{1,20})[^\\s]+")) %>%
+  # convert extracted columns to numbers
+  type_convert() %>% 
+  mutate(gencode_reads = gencode_reads / 1e6) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  print()
+  
+gencode_stats %>%
+  ggplot(aes(x = sample , y = gencode_reads, color = treatment)) +
+  theme(strip.placement = "outside") +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_color_manual(values = cbPalette[1:3]) +
+  labs(y = "reads aligning to\nhuman transcripts(× 10⁶)", x = "", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "vertical",
+        legend.box.margin = margin(l = 0)) +
+  scale_y_continuous(position = "top", limits = c(0, NA), breaks = scales::pretty_breaks(n=3))
+
+ggsave("../figures/gencode_alignment_stats.pdf", device = cairo_pdf)
+```
+
+## Plot flu alignment stats
+
+### Read in all flu alignments
+```{r, warning=F}
+bamfilelist <- list.files("../processeddata", full.names = T, recursive = T,
+                            pattern = "flu.genome.sorted.bam$")
+
+samplenames <- str_extract(bamfilelist, "(?<=processeddata/{1,2})[^/]+")
+
+### Calculate trimmed and weighted read coverage over genome
+# retrieve alignments along with the RSEM posterior probability
+aln <- bamfilelist %>% 
+  # read in all alignments
+  map(.  %>% readGAlignments(param = ScanBamParam(tag = 'ZW'))) %>% 
+  # assign sample names
+  map2(samplenames, function(aln, name) plyranges::mutate(aln, sample = name)) %>% 
+  # convert list of galignments to galignmentslist
+  GAlignmentsList() %>% 
+  # convert to named galignments for each manipulation
+  unlist() 
+      
+mcols(aln)$qwidth <- qwidth(aln)
+```
+
+### Plot flu alignment stats
+```{r, fig.width=1.6, fig.height=2.4}
+flu_stats <- aln %>% 
+  tidy() %>% 
+  group_by(sample, strand) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(flu_reads = n / 1e5) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  print()
+
+flu_stats %>%
+  ggplot(aes(x = sample , y = flu_reads, color = treatment, shape = strand)) +
+  theme(strip.placement = "outside") +
+  geom_point(alpha = 0.8) +
+  coord_flip() +
+  scale_color_manual(values = cbPalette[1:3]) +
+  labs(y = "reads aligning to\nflu transcripts(× 10^5)", x = "", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "vertical",
+        legend.box.margin = margin(l = 0)) +
+  scale_y_continuous(position = "top", limits = c(0, NA), breaks = scales::pretty_breaks(n=3))
+
+ggsave("../figures/flu_alignment_stats.pdf", device = cairo_pdf)
+```

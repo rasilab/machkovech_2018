@@ -1,0 +1,602 @@
+---
+title: "Plot figures for flu starts"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=F}
+# for handling htseq alignments
+library(GenomicAlignments)
+# for handling genomic annotations
+library(GenomicFeatures)
+# for string concatenation
+library(glue)
+# for string analysis
+library(stringr)
+# low level graphics
+library(grid)
+# for venn diagrams
+library(VennDiagram)
+# for sequence logo plots
+library(ggseqlogo)
+# for reading and writing genomic files
+library(rtracklayer)
+# for converting between bioconductor and tidyverse
+library(biobroom)
+# for biconductor tidyverse interface
+library(plyranges)
+# for munging data
+library(tidyverse)
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+```
+
+## Plotting defaults
+```{r, message=F}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", 
+    "#D55E00", "#F0E442")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8),
+  axis.line = element_line(size=.25),
+  axis.text = element_text(color = "black"),
+  plot.title = element_text(size = 8, hjust = 0.5)
+))
+```
+
+## Read in flu genome and annotations
+```{r, message=F}
+flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                        "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                             "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_genome <- Biostrings::readDNAStringSet(flu_genome_file) 
+flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) 
+
+pb1_f2 <- GRanges("PB1", IRanges(24+ 94, width = 88*3), strand = "+") %>% 
+  mutate(source = "HMM", type = "CDS", score = NA, phase = NA, gene_id = "PB1", 
+         gene_name = "PB1", transcript_id = "PB1F2", tss_id = "PB1")
+
+flu_annotations_with_pb1f2 <- c(flu_annotations, pb1_f2)
+```
+
+## Get all CDS including PB1-F2
+```{r}
+flu_cds <- flu_annotations_with_pb1f2 %>% 
+  filter(type == "CDS") %>% 
+  split(.$transcript_id) %>% 
+  print()
+```
+
+## Read in flu starts
+```{r, message=F}
+flu_starts <- flu_annotations %>% 
+  filter(type == "start_codon" | type == "stop_codon") %>% 
+  tidy() %>% 
+  select(seqname, transcript_id, gene_name, type, start) %>% 
+  spread(type, start) %>% 
+  print()
+```
+
+## Read in coverage across flu genome 
+```{r, message=F}
+cvg <- list.files("../coverage", full.names = T, recursive = T) %>% 
+  # get covearge file
+  str_subset("flu.+tsv.gz$") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "[^/\\.]+(?=\\.flu)")) %>% 
+  enframe("sample", "file") %>%
+  # exclude deblurred or pooled samples
+  filter(!str_detect(file, "deblurred|pooled")) %>%
+  # include only + strand coverage
+  filter(str_detect(file, "plus")) %>%
+  mutate(data = map(file, function(x) suppressMessages(read_tsv(x, na = "")))) %>%
+  select(-file) %>%
+  unnest() %>%
+  mutate(sample = as.factor(sample)) %>%
+  # combine NP reads from NP, NPhighCTG
+  mutate(seqname = if_else(str_detect(seqname, "NP"), "NP", seqname)) %>% 
+  group_by(seqname, sample, start, end) %>% 
+  summarize(score = sum(score)) %>% 
+  ungroup() %>% 
+  filter(score > 0) %>% 
+  # convert each range of length > 1 to a sequence of ranges of length 1
+  mutate(pos = map2(start, end, function(x, y) seq(x, y)))  %>% 
+  unnest() %>% 
+  mutate(start = pos, end = pos) %>% 
+  select(-pos) %>% 
+  print()
+```
+
+## Read in called starts
+
+The starts are called in [call_flu_start_sites.Rmd](call_flu_start_sites.Rmd).
+```{r, message=F}
+flu_called_starts <- read_tsv("../tables/called_flu_tis.tsv.gz", 
+                              na = c(""), col_types = c(col_character())) %>% 
+  mutate(sample = str_replace(sample, "_plus", ""))
+
+# include only starts that are called more than once (in both flu samples)
+common_starts <- flu_called_starts %>% 
+  group_by(chr, tis.start) %>% 
+  filter(n() > 1) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  select(-sample) %>% 
+  # include repeated sites in multiple isoforms only once (for M1/M2)
+  group_by(chr, chr.pos) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(nt_to_atis = if_else(
+    nt_to_atis == "NA", 
+    chr.pos, 
+    as.integer(nt_to_atis)
+  ))
+
+common_starts %>% 
+  rename(nt_to_atis = nt_to_atis, peplen = peptide_length) %>% 
+  print(n=28)
+```
+
+## Plot overlap in called starts between samples
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+p <- draw.pairwise.venn(21, 18, 14, 
+                   category = c("vir", "ifn +\nvir"), 
+                   fill = "grey", 
+                   cat.pos = c(-40, 30),
+                   cat.dist = c(0.04,0.04))
+
+ggsave("../figures/overlap_between_samples.pdf", plot = p)
+```
+
+## Coverage plot of all flu transcripts
+```{r, message=F, fig.width=8, fig.height=3}
+plot_data <- cvg %>% 
+  filter(sample %in% c("ltm_vir", "cyclo_vir")) %>% 
+  left_join(common_starts %>% select(chr, chr.pos, codon, nt_to_atis), 
+            by = c("seqname" = "chr", "start" = "chr.pos")) %>% 
+  # adjust start to be 1 for canonical start for plotting
+  left_join(flu_starts, by = "seqname") %>% 
+  mutate(pos = start - start_codon + 1) %>%                       
+  # get rid stop codon in plot
+  filter(start < stop_codon - 3) %>%
+  
+  # get y position for each tx to show called starts
+  group_by(seqname, pos) %>% 
+  mutate(y_start = sum(score)) %>% 
+  ungroup() %>% 
+  group_by(seqname) %>% 
+  mutate(y_start = - 0.1 * max(y_start)/100) %>% 
+  ungroup() %>% 
+  
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment])
+                    
+tis_location <- plot_data %>% 
+  mutate(start = if_else(nt_to_atis == 0, 'aTIS', 'dTIS'))
+                    
+plot_data %>%  
+  ggplot(aes(x = pos, y = score/100, color = treatment, fill = treatment)) + 
+  facet_wrap(~ seqname, ncol = 4, scales = "free") + 
+  geom_col(aes(size = treatment, group = treatment)) +
+  geom_point(aes(x = pos, y = y_start, shape = start),
+             data = tis_location, size = 0.9, color = "black") +
+  scale_color_manual(values = cbPalette[2:3]) +
+  scale_fill_manual(values = cbPalette[2:3]) +
+  scale_size_manual(values = c(0.5, 1)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=3)) +
+  labs(x = "distance from annotated TIS (nt)", y = "P-site counts (x10^2)", fill = "") +
+  theme(legend.key.height = unit(2, "pt"), legend.position = "bottom",
+        legend.box = "horizontal") +
+  guides(color = F, size = F)
+      
+ggsave('../figures/coverage_along_flu_tx_vir.pdf', 
+       units = 'in')
+```
+
+## Same plot as above but for ltm_ifn_vir sample
+```{r, message=F, fig.width=8, fig.height=3}
+plot_data <- cvg %>% 
+  filter(sample %in% c("ltm_ifn_vir", "cyclo_ifn_vir")) %>% 
+  left_join(common_starts %>% select(chr, chr.pos, codon, nt_to_atis), 
+            by = c("seqname" = "chr", "start" = "chr.pos")) %>% 
+  # adjust start to be 1 for canonical start for plotting
+  left_join(flu_starts, by = "seqname") %>% 
+  mutate(pos = start - start_codon + 1) %>%                       
+  # get rid stop codon in plot
+  filter(start < stop_codon - 3) %>%
+  
+  # get y position for each tx to show called starts
+  group_by(seqname, pos) %>% 
+  mutate(y_start = sum(score)) %>% 
+  ungroup() %>% 
+  group_by(seqname) %>% 
+  mutate(y_start = - 0.1 * max(y_start)/100) %>% 
+  ungroup() %>% 
+  
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment])
+                    
+tis_location <- plot_data %>% 
+  mutate(start = if_else(nt_to_atis == 0, 'aTIS', 'dTIS'))
+                    
+plot_data %>%  
+  ggplot(aes(x = pos, y = score/100, color = treatment, fill = treatment)) + 
+  facet_wrap(~ seqname, ncol = 4, scales = "free") + 
+  geom_col(aes(size = treatment, group = treatment)) +
+  geom_point(aes(x = pos, y = y_start, shape = start),
+             data = tis_location, size = 0.9, color = "black") +
+  scale_color_manual(values = cbPalette[2:3]) +
+  scale_fill_manual(values = cbPalette[2:3]) +
+  scale_size_manual(values = c(0.5, 1)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=3)) +
+  labs(x = "distance from annotated TIS (nt)", y = "P-site counts (x10^2)", fill = "") +
+  theme(legend.key.height = unit(2, "pt"), legend.position = "bottom",
+        legend.box = "horizontal") +
+  guides(color = F, size = F)
+      
+ggsave('../figures/coverage_along_flu_tx_ifn_vir.pdf', 
+       units = 'in')
+```
+
+## RNA-Seq coverage plot of polymerase genes
+```{r, message=F, fig.width=6, fig.height=3}
+plot_data <- cvg %>% 
+  filter(sample %in% c("mrna_vir", "mrna_ifn_vir")) %>% 
+  left_join(common_starts %>% select(chr, chr.pos, codon, nt_to_atis), 
+            by = c("seqname" = "chr", "start" = "chr.pos")) %>% 
+  # adjust start to be 1 for canonical start for plotting
+  left_join(flu_starts, by = "seqname") %>% 
+  group_by(seqname) %>% 
+  # get y position for each tx to show called starts
+  mutate(y_start = - 0.1 * max(score)) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  filter(seqname %in% c("PB1", "PB2", "PA"))
+                    
+plot_data %>%  
+  ggplot(aes(x = start, y = score, color = treatment, fill = treatment)) + 
+  facet_wrap(sample ~ seqname, ncol = 3, scales = "free") + 
+  geom_col(aes(size = treatment, group = treatment)) +
+  scale_color_manual(values = cbPalette) +
+  scale_fill_manual(values = cbPalette) +
+  scale_size_manual(values = c(0.5, 1)) +
+  labs(x = "distance from 5' end (nt)", y = "read counts", fill = "") +
+  theme(legend.key.height = unit(2, "pt"), legend.position = "bottom",
+        legend.box = "horizontal") +
+  guides(color = F, size = F, fill = F)
+      
+ggsave('../figures/rnaseq_coverage_along_polymerase_genes.pdf', 
+       units = 'in')
+```
+## Local maximum example plot for Fig. 3A
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+plot_data <- cvg %>% 
+  filter(sample == "ltm_vir") %>% 
+  left_join(common_starts %>% select(chr, chr.pos, codon, nt_to_atis), 
+            by = c("seqname" = "chr", "start" = "chr.pos")) %>% 
+  # create a sequence from start to stop for each range
+  mutate(pos = map2(start, end, function(x, y) seq(from = x, to = y))) %>% 
+  # expand each range to equal its length
+  unnest() %>% 
+  # adjust start to be 1 for canonical start for plotting
+  left_join(flu_starts, by = "seqname") %>% 
+  mutate(pos = pos - start_codon + 1) %>%                       
+  group_by(seqname) %>% 
+  mutate(y_start = - 0.1 * max(score)) %>% 
+  ungroup()                   
+                    
+tis_location <- plot_data %>% 
+  filter(!is.na(codon)) %>% 
+  mutate(start = if_else(nt_to_atis == 0, 'aTIS', 'dTIS')) 
+                    
+
+plot_data %>%            
+  filter(seqname == "NA" & start > 37 & start < 80 & score > 0) %>% 
+#   print(n = 100)                     
+  ggplot(aes(x = pos, y = score)) + 
+  geom_ribbon(data = filter(plot_data, abs(pos - 42) <= 15), ymin = 0, ymax = 2e3, fill = "#EEEEEE") +                    
+  geom_col(color = "black") +
+#   geom_point(aes(x = pos, y = y_start, shape = start), 
+#              data = tis_location, size = 0.9) + 
+  scale_color_manual(values = cbPalette[2:3]) +
+  labs(x = "nt from annotated TIS", y = "P-site counts",
+       title = "local max. within 30nt")
+      
+ggsave('../figures/local_maximum_example.pdf')
+```
+
+## Proportion of aTIS / dTIS
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+common_starts %>% 
+  mutate (tis.type = case_when(
+    nt_to_atis == 0 ~ "aTIS", 
+    nt_to_atis > 0 ~ "dTIS",
+    T ~ "other")) %>% 
+  count(tis.type) %>% 
+  ggplot(aes(x = tis.type, y = n)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "TIS type", y = "TIS counts") 
+
+ggsave('../figures/atis_vs_dtis_flu.pdf', 
+       units = 'in')
+```
+
+## Proportion of different codons in TIS
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+common_starts %>% 
+  count(codon) %>% 
+  ggplot(aes(x = forcats::fct_relevel(codon, "AUG"), y = n)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "codon", y = "TIS counts", title = "called TIS") +
+  scale_y_continuous(breaks = seq(0, 12, 4))
+
+ggsave('../figures/codon_proportion_flu_tis.pdf', 
+       units = 'in')
+```
+
+## Proportion of codons in genome
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+flu_genome[!names(flu_genome) %in% c("NPlowCTG", "NPhighCTG")] %>% 
+  oligonucleotideFrequency(width = 3, step = 1) %>% 
+  as_tibble() %>% 
+  gather(codon, counts) %>% 
+  # convert T to U in codons for plotting
+  mutate(codon = str_replace_all(codon, "T", "U")) %>% 
+  mutate(codon_group = if_else(codon %in% c("AUG"), codon, "other")) %>% 
+  group_by(codon_group) %>% 
+  summarize(counts = sum(counts)) %>% 
+  ungroup() %>% 
+  mutate(percent = counts / sum(counts) * 100) %>% 
+  mutate(codon = forcats::fct_relevel(codon_group, "AUG")) %>% 
+  ggplot(aes(x = codon, y = percent)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "codon", y = "proportion %", title = "flu genome")
+
+ggsave('../figures/codon_proportion_flu_genome.pdf', 
+       units = 'in')
+```
+
+## Frame count in TIS
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+common_starts %>% 
+  filter(codon != "other") %>% 
+  count(frame) %>% 
+  ggplot(aes(x = frame, y = n)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "frame", y = "TIS counts", title = "called TIS") +
+  scale_y_continuous(breaks = seq(0, 10, 5))
+
+ggsave('../figures/frame_proportion_flu_tis.pdf', 
+       units = 'in')
+```
+
+## Frame count of ATG in genome
+```{r, message=F, fig.width=1.2, fig.height=1.2}
+frame_frequency <- function(seq) {
+  frame1 <- oligonucleotideFrequency(subseq(seq, 1, width(seq)), 3, 3) %>% 
+    as_tibble() %>% gather(codon, counts) %>% mutate(frame = "0")
+  frame2 <- oligonucleotideFrequency(subseq(seq, 2, width(seq) - 2), 3, 3) %>% 
+    as_tibble() %>% gather(codon, counts) %>% mutate(frame = "1")
+  frame3 <- oligonucleotideFrequency(subseq(seq, 3, width(seq) - 1), 3, 3) %>% 
+    as_tibble() %>% gather(codon, counts) %>% mutate(frame = "2")
+  
+  bind_rows(frame1, frame2, frame3)  
+}
+
+
+flu_genome[!names(flu_genome) %in% c("NPlowCTG", "NPhighCTG")] %>% 
+  frame_frequency() %>% 
+  filter(codon %in% c("ATG")) %>% 
+  group_by(frame) %>% 
+  summarize(counts = sum(counts)) %>% 
+  ungroup() %>% 
+  mutate(percent = counts / sum(counts) * 100) %>% 
+  ggplot(aes(x = frame, y = percent)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "frame", y = "proportion %", title = "AUG in flu genome") 
+
+ggsave('../figures/frame_proportion_flu_genome.pdf', 
+       units = 'in')
+```
+
+## Plot ORF length of out-of-frame TIS
+```{r, message=F, fig.width=1.4, fig.height=1.2}
+plot_data <- common_starts %>% 
+  filter(frame != 0 & codon != "other") %>% 
+  mutate(orf_rep = map(peptide_length, function(x) seq(x))) %>% 
+  unnest() %>% 
+  unite(tis, chr, tis.start, sep = ":") %>%                          
+  mutate(tis = forcats::fct_reorder(tis, peptide_length, .desc = T))
+
+plot_data %>% 
+  ggplot(aes(x = orf_rep, y = tis)) +
+  geom_line(size = 0.25) +
+  geom_text(aes(x = peptide_length + 5, y = tis, label = peptide_length), 
+            size = 2, hjust = 0, 
+            data = plot_data %>% group_by(tis) %>% slice(1)
+            ) +   
+  labs(x = "out-of-frame\npeptide length", y = "called TIS") +
+  scale_x_continuous(limits = c(NA, 100))                        
+
+ggsave('../figures/orf_length.pdf', 
+       units = 'in')
+```
+
+## Peptide length of out-of-frame TIS in the flu genome
+```{r, message=F}
+noNPgenome <- flu_genome[!names(flu_genome) %in% c("NPlowCTG", "NPhighCTG")]
+```
+
+
+```{r, message=F}
+possible_tis <- str_locate_all(noNPgenome, "ATG")
+names(possible_tis) <- names(noNPgenome)
+possible_tis <- bind_rows(map(possible_tis, as_tibble), .id = "seqname") %>% 
+  left_join(flu_starts) %>% 
+  mutate(frame = (start - start_codon) %% 3) %>% 
+  mutate(codon = pmap(list(seqname, start, end), 
+                      function(x, y, z) as.character(subseq(noNPgenome[x],start = y, end = z)))) %>% 
+  unnest() %>%                        
+  print()
+```
+
+
+```{r, message=F}
+truncated <- subseq(noNPgenome[possible_tis[['seqname']]], 
+       start = possible_tis[['start']], 
+       end = width(noNPgenome[possible_tis[['seqname']]]))
+orfs <- str_extract(truncated, "^([ACTG]{3})+?(TAG|TGA|TAA)")
+# set all non-orfs and non-near cognate start orfs to blank
+orfs[is.na(orfs)] <- ""
+# extract peptides
+peptides <- translate(DNAStringSet(orfs))
+peptide_length <- width(peptides) - 1
+
+possible_tis <- possible_tis %>% 
+  mutate(peptide_length = peptide_length, peptide = as.character(peptides)) %>% 
+  print()
+```
+
+
+```{r, message=F}
+outofframe_peptides <- possible_tis %>% 
+  filter(frame != 0) %>% 
+  arrange(desc(peptide_length)) 
+
+outofframe_peptides <- outofframe_peptides %>% 
+  mutate(detected_row = map(peptide, 
+                            function(x) sum(str_detect(outofframe_peptides$peptide, x)))) %>% 
+  unnest() %>%                        
+  filter(detected_row == 1) %>%                              
+  select(-peptide, -detected_row) %>%                      
+  print(n = 20)
+```
+
+```{r, message=F, fig.width=1.4, fig.height=1.5}
+outofframe_peptides %>% 
+  ggplot(aes(peptide_length)) +
+  geom_histogram() +
+  labs(x = "out-of-frame\npeptide length", y = "ORF counts",
+       title = "flu genome") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3))
+
+ggsave('../figures/orf_length_flu_genome.pdf', 
+       units = 'in')
+```
+
+## Distribution of called TIS along mRNA
+```{r, message=F, fig.width=1.5, fig.height=1.2}
+common_starts %>% 
+  mutate(chr.length = width(flu_genome[chr])) %>% 
+  mutate(tis.location = chr.pos / chr.length) %>% 
+  mutate(tis.location = case_when(
+    tis.location < 1/3 ~ "front",
+    tis.location > 1/3 & tis.location < 2/3 ~ "middle",
+    tis.location > 2/3 ~ "back")) %>%
+  group_by(tis.location) %>% 
+  count()  %>% 
+  ungroup() %>% 
+  bind_rows(tibble("tis.location" = "back", "n" = 0)) %>% 
+  mutate(tis.location = forcats::fct_relevel(tis.location, "front", "middle")) %>%
+  ggplot(aes(tis.location, n)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "location along mRNA", y = "TIS counts", title = "called TIS")
+
+ggsave('../figures/tis_location.pdf', 
+       units = 'in')
+```
+
+## Distribution of possible TIS along flu genome
+```{r, message=F, fig.width=1.5, fig.height=1.2}
+possible_tis %>% 
+  mutate(chr.length = width(flu_genome[seqname])) %>% 
+  mutate(tis.location = start / chr.length) %>% 
+  mutate(tis.location = case_when(
+    tis.location < 1/3 ~ "front",
+    tis.location > 1/3 & tis.location < 2/3 ~ "middle",
+    tis.location > 2/3 ~ "back")) %>%
+  mutate(tis.location = forcats::fct_relevel(tis.location, "front", "middle")) %>% 
+  group_by(tis.location) %>% 
+  count()  %>% 
+  ungroup() %>% 
+  mutate(percent = n / sum(n) * 100) %>% 
+  ggplot(aes(x = tis.location, y = percent)) +
+  geom_col(fill = "grey", color = "black") +
+  labs(x = "location along mRNA", y = "proportion %", title = "AUG in\nflu genome")
+
+ggsave('../figures/tis_location_flu_genome.pdf', 
+       units = 'in')
+```
+
+## Logo plot of called TIS neighborhood
+```{r, message=F, fig.width=2, fig.height=1.2}
+logo.data <- common_starts %>% 
+  filter(tis.start != "NA") %>% 
+  mutate(tis.start = as.numeric(tis.start)) %>% 
+  mutate(logo.start = tis.start - 5, logo.end = tis.start + 8) %>% 
+  mutate(seq = pmap(list(chr, logo.start, logo.end),
+                    function(x,y,z) as.character(subseq(flu_genome[x], start = y, end = z)))) %>% 
+  unnest() %>%                    
+  mutate(seq = paste0(subseq(seq, 1, 5), "NNN", subseq(seq, 9, 13))) %>%                      
+  mutate (tis.type = if_else(nt_to_atis == 0, "aTIS", "dTIS")) %>% 
+  # convert T to U in codons for plotting
+  mutate(seq = str_replace_all(seq, "T", "U")) %>% 
+  select(tis.type, seq) 
+                    
+ggplot() +
+  geom_logo( logo.data %>% filter(tis.type == "aTIS") %>% pull(seq),
+            seq_type = "rna") +
+  theme(axis.ticks.x = element_blank(),
+        axis.line = element_blank()) +
+  scale_x_continuous(breaks = seq(1, 13, 2), 
+                     labels = c(seq(-5, -1, 2), seq(2, 8, 2))) +
+  labs(title = "aTIS", x = "distance from TIS")                    
+
+ggsave('../figures/atis_logo.pdf', 
+       units = 'in', device = cairo_pdf)
+                      
+ggplot() +
+  geom_logo( logo.data %>% filter(tis.type == "dTIS") %>% pull(seq),
+            seq_type = "rna") +
+  theme(axis.ticks.x = element_blank(),
+        axis.line = element_blank()) +
+  scale_x_continuous(breaks = seq(1, 13, 2), 
+                     labels = c(seq(-5, -1, 2), seq(2, 8, 2))) +
+  labs(title = "dTIS", x = "distance from TIS")                    
+                    
+ggsave('../figures/dtis_logo.pdf', 
+       units = 'in', device = cairo_pdf)
+                      
+```

@@ -1,0 +1,36 @@
+---
+title: "Convert TSV file to BigWig for viewing"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+params:
+  tsvfile: "../coverage/gencode/test.tsv.gz"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=FALSE}
+# for reading and writing standard genomic coord file formats
+library(rtracklayer)
+library(GenomicRanges)
+# string manipulation functions
+library(stringr)
+# standard analysis and plotting functions, includes dplyr, ggplot2 
+library(tidyverse)
+# loads lab default ggplot2 theme
+library(rasilabRtemplates)
+```
+
+```{r}
+cvg_gr <- read_tsv(params$tsvfile) %>% 
+  filter(score > 0) %>% 
+  GRanges() %>% 
+  coverage(weight = mcols(.)$score)
+
+export.bw(cvg_gr, str_replace(params$tsvfile, ".tsv.gz", ".bw"))
+```

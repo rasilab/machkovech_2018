@@ -1,0 +1,607 @@
+---
+title: "Analyze NP CTG counts"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries
+```{r, message=FALSE}
+library(Biostrings)
+library(stringr)
+library(glue)
+library(plyranges)
+library(biobroom)
+library(tidyverse)
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+
+
+np_variant_names <- c(
+  "NPhighCTG" = "high CUG NP",
+  "NPlowCTG" = "low CUG NP",
+  "non-unique" = "non-unique"
+)
+```
+
+## Plotting defaults
+```{r}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#888888","#E69F00", "#56B4E9", 
+               "#009E73", "#CC79A7", "#0072B2", "#D55E00", "#F0E442", "#333333")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8),
+  axis.line = element_line(size=.25),
+  axis.text = element_text(color = "black", size = 8)
+))
+```
+
+## Read in flu genome and annotations
+```{r}
+flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/", 
+                        "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_genome <- readDNAStringSet(flu_genome_file)
+
+flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/",
+                             "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) 
+
+np_start <- flu_annotations %>% 
+  filter(type == "start_codon" & seqnames == "NP") %>% 
+  start()
+```
+
+## Read in all NP aligned reads
+```{r}
+
+np_aln_files <- list.files("../processeddata/", pattern = "np_alignments.tsv",
+                           recursive = T, full.names = T)
+
+samplenames <- str_extract(np_aln_files, "([^/]+)(?=/+np_alignments.tsv)")
+
+np_aln <- np_aln_files %>% 
+  map(. %>% read_tsv(col_types = c(col_character()))) %>% 
+  magrittr::set_names(samplenames) %>% 
+  bind_rows(.id = "sample") %>% 
+  # keep track of np variant separately 
+  mutate(npvariant = seqname) %>% 
+  # label all sequences as from NP to enable easy grange operations
+  mutate(seqname = "NP") %>% 
+  # convert reads to cds coordinates 
+  mutate(start = start - np_start + 1, end = end - np_start + 1) %>% 
+  GRanges() %>% 
+  filter(width(.) < 40 | str_detect(sample, "mrna")) %>%
+  print()
+```
+
+## Find locations of mismatches between the two NP variants
+```{r}
+np_high_low_mismatches <- PairwiseAlignments(flu_genome[['NPhighCTG']], 
+                                             flu_genome[['NPlowCTG']]) %>% 
+  mismatchTable() %>% 
+  as_tibble() %>% 
+  mutate(start = PatternStart - np_start + 1, end = PatternEnd - np_start + 1, 
+         highvariant = PatternSubstring, lowvariant  = SubjectSubstring) %>% 
+  mutate(seqname = "NP") %>% 
+  select(seqname, start, end, highvariant, lowvariant) %>% 
+  mutate(mismatch.name = seq(n()), mismatch.loc = start) %>% 
+  GRanges() %>% 
+  print()
+```
+
+## Find overlaps between mismatches and reads
+```{r}
+aln_mismatch_overlaps <- np_aln %>% 
+  find_overlaps(np_high_low_mismatches) %>% 
+  # select only alignments to the NP CTG variants
+  filter(str_detect(npvariant, "CTG")) %>% 
+  mutate(qstart = start, qend = end) %>% 
+  # assign p-site to 14th nt if readlen <= 32nt, if not assign p-site to 15th nt
+  narrow(start = ifelse(width(.) <= 32, 14, 15)) %>% 
+  mutate(end = start) %>% 
+  # round mismatch location to frame 0 of the codon
+  # for eg. both mismatches in TTA -> CTG will be assigned to the first C
+  mutate(mismatch.loc = ceiling(mismatch.loc/3) * 3 - 2) %>% 
+  print()
+```
+
+## Extract alignments that do not overlap with the mismatches for coverage plot
+```{r}
+aln_non_overlaps <- np_aln %>% 
+  tidy() %>% 
+  anti_join(
+    aln_mismatch_overlaps %>% 
+    tidy() %>% 
+    select(start, sample, names, npvariant), by = "names") %>% 
+  GRanges() %>% 
+  # assign p-site to 14th nt if readlen <= 32nt, if not assign p-site to 15th nt
+  narrow(start = ifelse(width(.) > 32, 14, 15)) %>% 
+  mutate(end = start) %>% 
+  # select unique alignments and call them common since they align to both
+  # high and low CTG
+  tidy() %>% 
+  group_by(sample, names) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  select(start, sample, names) %>% 
+  mutate(type = "non-unique") %>% 
+  print()
+```
+
+## Extract uniquely-mapping alignments for coverage plot
+```{r}
+all_aln <- aln_mismatch_overlaps %>% 
+  tidy() %>% 
+  select(start, sample, names, npvariant) %>% 
+  rename(type = npvariant) %>% 
+  group_by(sample, names) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  bind_rows(aln_non_overlaps) %>% 
+  print()
+  
+```
+
+## Table of proportion of unique and non-unique reads
+```{r}
+all_aln %>% 
+  group_by(sample, type) %>% 
+  count() %>% 
+  ungroup() %>% 
+  group_by(sample) %>% 
+  mutate(proportion = n / sum(n) * 100) %>% 
+  filter(str_detect(type, "CTG") & str_detect(sample, "vir")) %>% 
+  mutate(highlowprop = n / sum(n) * 100) %>% 
+  filter(str_detect(type, "high")) %>% 
+  print(n=35)
+```
+
+## Plot coverage of mismatch-aligning and common reads, +vir sample
+```{r, fig.width=5, fig.height=3}
+plot_data <- all_aln %>%
+  filter(str_detect(sample, "(?<!ifn)_vir")) %>%
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) 
+
+# extract mismatch locations for indicating at the top
+mismatch_loc <- np_high_low_mismatches %>% 
+  tidy() %>% 
+  # round mismatch location to frame 0 of the codon
+  # for eg. both mismatches in TTA -> CTG will be assigned to the first C
+  mutate(mismatch.loc = ceiling(mismatch.loc/3) * 3 - 2) %>% 
+  group_by(mismatch.loc) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(start = mismatch.loc, mutationloc = T) %>% 
+  select(start, mutationloc) %>% 
+  full_join(plot_data, by = "start") %>% 
+  group_by(treatment, start) %>% 
+  mutate(y = sum(n)) %>% 
+  ungroup() %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  filter(mutationloc == T) %>% 
+  ungroup() %>% 
+  complete(start, nesting(sample, type), treatment, fill = list(mutationloc = T, n = 0, y = 0)) %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  ungroup()
+
+rect <- tibble(ymax = c(1000, 300, 2000)) %>% 
+  mutate(sample = names(sample_names)[1:3]) %>% 
+  slice(1) %>% 
+  mutate(xmin = 302, xmax = 341, ymin = 0, type = "high CTG NP")
+
+all_aln %>%
+  filter(str_detect(sample, "(?<!ifn)_vir")) %>%
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) %>% 
+  ggplot(aes(x = start, y = n, color = type, fill = type)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_y") +
+  geom_rect(xmin = 302, xmax = 341, ymin = -1000, ymax = 3000, 
+            fill = "palegreen", alpha = 0.1, color = NA) +
+  geom_col() +
+  geom_point(aes(y = y), data = mismatch_loc, shape = 25, show.legend = F, 
+             color = "black", fill = "ghostwhite") +
+  guides(color = F) +
+  scale_color_manual(values = cbPalette[c(1,5,6)]) +
+  scale_fill_manual(values = cbPalette[c(1,5,6)]) +
+  labs(x = "distance from annotated TIS (nt)", y = "counts", fill = "") +
+  theme(legend.key.height = unit(10, "pt"), legend.position = "bottom",
+        legend.box = "horizontal") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 6))
+
+ggsave('../figures/coverage_along_np_vir.pdf',
+       units = 'in')
+```
+
+## Same plot as above, +ifn +vir sample
+```{r, fig.width=5, fig.height=3}
+plot_data <- all_aln %>%
+  filter(str_detect(sample, "(?<=ifn)_vir")) %>%
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) 
+
+# extract mismatch locations for indicating at the top
+mismatch_loc <- np_high_low_mismatches %>% 
+  tidy() %>% 
+  # round mismatch location to frame 0 of the codon
+  # for eg. both mismatches in TTA -> CTG will be assigned to the first C
+  mutate(mismatch.loc = ceiling(mismatch.loc/3) * 3 - 2) %>% 
+  group_by(mismatch.loc) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(start = mismatch.loc, mutationloc = T) %>% 
+  select(start, mutationloc) %>% 
+  full_join(plot_data, by = "start") %>% 
+  group_by(treatment, start) %>% 
+  mutate(y = sum(n)) %>% 
+  ungroup() %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  filter(mutationloc == T) %>% 
+  ungroup() %>% 
+  complete(start, nesting(sample, type), treatment, fill = list(mutationloc = T, n = 0, y = 0)) %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  ungroup() 
+
+rect <- tibble(ymax = c(1000, 300, 2000)) %>% 
+  mutate(sample = names(sample_names)[1:3]) %>% 
+  slice(1) %>% 
+  mutate(xmin = 302, xmax = 341, ymin = 0, type = "high CTG NP")
+
+all_aln %>%
+  filter(str_detect(sample, "(?<=ifn)_vir")) %>%
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) %>% 
+  ggplot(aes(x = start, y = n, color = type, fill = type)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_y") +
+  geom_rect(xmin = 302, xmax = 341, ymin = -1000, ymax = 3000, 
+            fill = "palegreen", alpha = 0.1, color = NA) +
+  geom_col() +
+  geom_point(aes(y = y), data = mismatch_loc, shape = 25, show.legend = F, 
+             color = "black", fill = "ghostwhite") +
+  guides(color = F) +
+  scale_color_manual(values = cbPalette[c(1,5,6)]) +
+  scale_fill_manual(values = cbPalette[c(1,5,6)]) +
+  labs(x = "distance from annotated TIS (nt)", y = "counts", fill = "") +
+  theme(legend.key.height = unit(10, "pt"), legend.position = "bottom",
+        legend.box = "horizontal") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 6))
+
+ggsave('../figures/coverage_along_np_ifn_vir.pdf',
+       units = 'in')
+```
+
+## Same plot as above, but for the region around the putative CTG start, +vir sample
+```{r, fig.width=3, fig.height=3}
+
+plot_data <- all_aln %>%
+  filter(str_detect(sample, "(?<!ifn)_vir")) %>%
+  filter(start %in% seq(302, 341)) %>% 
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) 
+  
+# extract mismatch locations for indicating at the top
+mismatch_loc <- np_high_low_mismatches %>% 
+  tidy() %>% 
+  # round mismatch location to frame 0 of the codon
+  # for eg. both mismatches in TTA -> CTG will be assigned to the first C
+  mutate(mismatch.loc = ceiling(mismatch.loc/3) * 3 - 2) %>% 
+  group_by(mismatch.loc) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(start = mismatch.loc, mutationloc = T) %>% 
+  select(start, mutationloc) %>% 
+  full_join(plot_data, by = "start") %>% 
+  mutate(n = if_else(is.na(n), as.integer(0), n)) %>% 
+  filter(start %in% seq(302, 341)) %>% 
+  group_by(treatment, start) %>% 
+  mutate(y = sum(n)) %>% 
+  ungroup() %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  filter(mutationloc == T) %>% 
+  ungroup() %>% 
+  complete(start, nesting(sample, type), treatment, fill = list(mutationloc = T, n = 0, y = 0)) %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  ungroup() 
+  
+plot_data %>% 
+  ggplot(aes(x = start, y = n, color = type, fill = type)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_y") +
+  geom_col() +
+  geom_point(aes(y = y), data = mismatch_loc, shape = 25, 
+             color = "black", fill = "ghostwhite", show.legend = F) +
+  guides(color = F) +
+  scale_color_manual(values = cbPalette[c(1,5,6)]) +
+  scale_fill_manual(values = cbPalette[c(1,5,6)]) +
+  labs(x = "distance from annotated TIS (nt)", y = "counts", fill = "") +
+  # theme(legend.key.height = unit(2, "pt"), legend.position = "bottom",
+  #       legend.box = "horizontal", legend.key.width = unit(10, "pt")) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 4)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 6))
+
+ggsave('../figures/coverage_along_np_vir_zommed.pdf',
+       units = 'in')
+```
+
+## Same plot as above, but for the region around the putative CTG start, +ifn +vir sample
+```{r, fig.width=3, fig.height=3}
+
+plot_data <- all_aln %>%
+  filter(str_detect(sample, "(?<=ifn)_vir")) %>%
+  filter(start %in% seq(302, 341)) %>% 
+  group_by(start, sample, type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  mutate(type = np_variant_names[type]) %>% 
+  mutate(type = forcats::fct_relevel(type, "non-unique")) 
+  
+# extract mismatch locations for indicating at the top
+mismatch_loc <- np_high_low_mismatches %>% 
+  tidy() %>% 
+  # round mismatch location to frame 0 of the codon
+  # for eg. both mismatches in TTA -> CTG will be assigned to the first C
+  mutate(mismatch.loc = ceiling(mismatch.loc/3) * 3 - 2) %>% 
+  group_by(mismatch.loc) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(start = mismatch.loc, mutationloc = T) %>% 
+  select(start, mutationloc) %>% 
+  full_join(plot_data, by = "start") %>% 
+  filter(start %in% seq(302, 341) & !is.na(treatment)) %>%
+  group_by(treatment, start) %>%
+  mutate(y = sum(n)) %>%
+  ungroup() %>%
+  group_by(treatment) %>%
+  mutate(y = max(y) * 1.2) %>%
+  filter(mutationloc == T) %>%
+  ungroup() %>% 
+  complete(start, nesting(sample, type), treatment, fill = list(mutationloc = T, n = 0, y = 0)) %>% 
+  group_by(treatment) %>% 
+  mutate(y = max(y)) %>% 
+  ungroup()
+
+plot_data %>%
+  ggplot(aes(x = start, y = n, color = type, fill = type)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_y") +
+  geom_col() +
+  geom_point(aes(y = y), data = mismatch_loc, shape = 25,
+             color = "black", fill = "ghostwhite", show.legend = F) +
+  guides(color = F) +
+  scale_color_manual(values = cbPalette[c(1,5,6)]) +
+  scale_fill_manual(values = cbPalette[c(1,5,6)]) +
+  labs(x = "distance from annotated TIS (nt)", y = "counts", fill = "") +
+  # theme(legend.key.height = unit(2, "pt"), legend.position = "bottom",
+  #       legend.box = "horizontal", legend.key.width = unit(10, "pt")) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 4)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 6))
+
+ggsave('../figures/coverage_along_np_ifn_vir_zommed.pdf',
+       units = 'in')
+```
+
+## Plot count for high vs low CTG in a 5nt window around each mismatch codon for virus sample
+```{r, fig.width=12, fig.height=5, message=F, warning=F}
+aln_mismatch_overlaps %>% 
+  tidy() %>% 
+  # select only virus-treated samples
+  filter(str_detect(sample, "(?<!ifn)_vir$")) %>%
+  group_by(sample, npvariant, mismatch.loc, start) %>% 
+  count() %>% 
+  ungroup() %>%
+  # label reads whose p-site is between 3 to -1 nt 5' from the mismatch location rounded to frame 0
+  mutate(mismatch.psite.distance = mismatch.loc - start) %>% 
+  filter(mismatch.psite.distance %in% seq(-1, 3)) %>% 
+  mutate(pos = as.factor(mismatch.loc)) %>% 
+  ggplot(aes(x = pos, y = n, shape = npvariant, color = factor(mismatch.psite.distance))) +
+  facet_wrap(~ sample, ncol = 1) +
+  geom_jitter(width = 0.25, height = 0) +
+  scale_y_continuous(trans = "log2", 
+                     breaks = scales::trans_breaks("log2", function(x) 2^x)) +
+  scale_color_manual(values = cbPalette) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  labs(x = "distance from aTIS to 1st nt of mismatch codon", 
+       y = "trimmed read counts",
+       shape = "NP variant",
+       color = "distance between\n1st nt of mismatch codon\n& footprint P site") +
+  scale_shape_manual(values = c(16, 21)) 
+
+ggsave('../figures/read_counts_at_np_mismatch_codons_vir.pdf', device = cairo_pdf)
+```
+
+## Plot count for high vs low CTG in a 5nt window around each mismatch codon for IFN + virus sample
+```{r, fig.width=12, fig.height=5, message=F, warning=F}
+aln_mismatch_overlaps %>% 
+  tidy() %>% 
+  # select only virus-treated samples
+  filter(str_detect(sample, "ifn_vir$")) %>%
+  group_by(sample, npvariant, mismatch.loc, start) %>% 
+  count() %>% 
+  ungroup() %>%
+  # label reads whose p-site is between 3 to -1 nt 5' from the mismatch location rounded to frame 0
+  mutate(mismatch.psite.distance = mismatch.loc - start) %>% 
+  filter(mismatch.psite.distance %in% seq(-1, 3)) %>% 
+  mutate(pos = as.factor(mismatch.loc)) %>% 
+  ggplot(aes(x = pos, y = n, shape = npvariant, color = factor(mismatch.psite.distance))) +
+  facet_wrap(~ sample, ncol = 1) +
+  geom_jitter(width = 0.25, height = 0) +
+  scale_y_continuous(trans = "log2", 
+                     breaks = scales::trans_breaks("log2", function(x) 2^x)) +
+  scale_color_manual(values = cbPalette) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  labs(x = "distance from aTIS to 1st nt of mismatch codon", 
+       y = "trimmed read counts",
+       shape = "NP variant",
+       color = "distance between\n1st nt of mismatch codon\n& footprint P site") +
+  scale_shape_manual(values = c(16, 21)) 
+
+ggsave('../figures/read_counts_at_np_mismatch_codons_ifn_vir.pdf', device = cairo_pdf)
+```
+
+## Plot fold-change vs count for high/low CTG for all unique reads for +vir sample
+
+ - I will add a value of 1 to all counts to prevent zero counts at some positions. This will have the effect of only decreasing fold-changes, so it is a conservative estimate compared to the raw counts. This still does not account for fact that lower counts will have more variability. 
+
+
+```{r, fig.width=3, fig.height=3, message=F, warning=F}
+aln_mismatch_overlaps %>% 
+  tidy() %>% 
+  # select only ifn + virus-treated samples
+  filter(str_detect(sample, "(?<!ifn)_vir$")) %>%
+  group_by(sample, npvariant, mismatch.loc, start) %>% 
+  count() %>% 
+  ungroup() %>%
+  # add 1 to each location that has counts only in 1 sample
+  # calculate sum and ratio of NP variants for MA plot
+  spread(npvariant, n, fill = 1) %>% 
+  mutate(mean_log2count = log2(NPhighCTG + NPlowCTG) - 1, 
+         log2ratio = log2(NPhighCTG) - log2(NPlowCTG)) %>% 
+  # label reads based on how far they are from the mismatch location
+  # specifically, look at reads that are upto 10nt upstream of each mismatch
+  mutate(mismatch.psite.distance = mismatch.loc - start) %>% 
+  mutate(distance.class = if_else(mismatch.psite.distance %in% seq(-1,6),
+                                  as.character(mismatch.psite.distance), "<-1 & >6" )) %>% 
+  mutate(distance.class = forcats::fct_relevel(distance.class, "<-1 & >6")) %>% 
+  mutate(outlier_322 = if_else(start %in% seq(322, 322) & mismatch.loc == 322,
+         as.character(start), as.character(NA))) %>% 
+  mutate(outlier_322_size = if_else(start %in% seq(322, 322) & mismatch.loc == 322,
+         "CUG322", "other")) %>% 
+  mutate(outlier_322_size = forcats::fct_rev(outlier_322_size)) %>% 
+  arrange(outlier_322_size) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  ggplot(aes(x = mean_log2count, y = log2ratio)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_x") +
+  geom_point(aes(color = outlier_322_size), 
+             alpha = 0.9, size = 0.5) +
+  # ggrepel::geom_text_repel(aes(label = outlier_322), force = 0.2,
+  #                          show.legend = F, color = "#333333", size = 2.8) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(x = expression("Mean "*log[2]*" read counts\n(high + low, CUG NP)"), 
+       y = expression(log[2]*" fold-change (high / low, CUG NP)"),
+       color = ""
+       ) +
+  scale_shape_manual(values = c(16, 21)) +
+  scale_y_continuous(limits = c(NA, 8))
+
+ggsave('../figures/ma_plot_read_counts_at_np_mismatch_codons_vir.pdf')
+```
+
+## Plot fold-change vs count for high/low CTG for all unique reads for +IFN+vir sample
+
+ - Same plot as above but for +IFN+vir sample
+
+```{r, fig.width=3, fig.height=3, message=F, warning=F}
+aln_mismatch_overlaps %>% 
+  tidy() %>% 
+  # select only ifn + virus-treated samples
+  filter(str_detect(sample, "(?<=ifn)_vir$")) %>%
+  group_by(sample, npvariant, mismatch.loc, start) %>% 
+  count() %>% 
+  ungroup() %>%
+  # add 1 to each location that has counts only in 1 sample
+  # calculate sum and ratio of NP variants for MA plot
+  spread(npvariant, n, fill = 1) %>% 
+  mutate(mean_log2count = log2(NPhighCTG + NPlowCTG) - 1, 
+         log2ratio = log2(NPhighCTG) - log2(NPlowCTG)) %>% 
+  # label reads based on how far they are from the mismatch location
+  # specifically, look at reads that are upto 10nt upstream of each mismatch
+  mutate(mismatch.psite.distance = mismatch.loc - start) %>% 
+  mutate(distance.class = if_else(mismatch.psite.distance %in% seq(-1,6),
+                                  as.character(mismatch.psite.distance), "<-1 & >6" )) %>% 
+  mutate(distance.class = forcats::fct_relevel(distance.class, "<-1 & >6")) %>% 
+  mutate(outlier_322 = if_else(start %in% seq(322, 322) & mismatch.loc == 322,
+         as.character(start), as.character(NA))) %>% 
+  mutate(outlier_322_size = if_else(start %in% seq(322, 322) & mismatch.loc == 322,
+         "CUG322", "other")) %>% 
+  mutate(outlier_322_size = forcats::fct_rev(outlier_322_size)) %>% 
+  arrange(outlier_322_size) %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = forcats::fct_rev(treatment_names[treatment])) %>% 
+  ggplot(aes(x = mean_log2count, y = log2ratio)) +
+  facet_wrap(~ treatment, ncol = 1, scales = "free_x") +
+  geom_point(aes(color = outlier_322_size), 
+             alpha = 0.9, size = 0.5) +
+  # ggrepel::geom_text_repel(aes(label = outlier_322), force = 0.2,
+  #                          show.legend = F, color = "#333333", size = 2.8) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(x = expression("Mean "*log[2]*" read counts\n(high + low, CUG NP)"), 
+       y = expression(log[2]*" fold-change (high / low, CUG NP)"),
+       color = ""
+       ) +
+  scale_shape_manual(values = c(16, 21)) +
+  scale_y_continuous(limits = c(NA, 8))
+
+ggsave('../figures/ma_plot_read_counts_at_np_mismatch_codons_ifn_vir.pdf')
+```

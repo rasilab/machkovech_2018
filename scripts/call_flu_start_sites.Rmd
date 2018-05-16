@@ -1,0 +1,320 @@
+---
+title: "Call flu start sites"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+
+Criteria used for calling start sites below: 
+
+1. LTM peak is a gene-specific outlier with p < 0.01 for a ZTNB fit for bottom 99% detected P sites in *each gene*.
+
+2. CHX must have non-zero counts (> 1 below).
+
+3. The gene-specific ZTNB P value for the peak should be 1000-fold lower for LTM fit over CHX fit OR the absolute LTM P value should be less than 1e-7. 
+
+4. LTM peak is a local maxima when considering other peaks 15nt upstream or downstream.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Load libraries and define analysis-specific parameters
+```{r, message=F}
+library(stringr)
+library(broom)
+library(biobroom)
+library(glue)
+library(grid)
+library(scales)
+library(tidyverse)
+
+# called sites
+local_pvalue_threshold <- 0.01
+cyclo_ltm_p_ratio <- 1000
+window_size <- 15
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+```
+
+## Plotting defaults 
+```{r, message=FALSE}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", 
+               "#D55E00", "#F0E442")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+            theme(          
+              strip.background = element_blank(),
+              legend.text = element_text(size = 8),
+              strip.text.x = element_text(size = 8),
+              axis.line = element_line(size=.25),
+              axis.text = element_text(color = "black"),
+              plot.title = element_text(size = 8)
+            ))
+```
+
+
+## Zero-truncated negative binomial definitions
+```{r, message=FALSE}
+# ZTNB is a negative binomial normalized by (1 - P(yi = 0))
+# I am using the mu, alpha (1/size) parametrization:
+# https://en.wikipedia.org/wiki/Negative_binomial_distribution#Alternative_formulations
+
+# probablilty density
+dztnb <- function(theta, y) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  dnbinom(y, size = size, mu = mu) / (1 - dnbinom(0, size = size, mu = mu))
+}
+
+# negative log likelihood
+lldztnb <- function(theta, y) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  (- sum(dnbinom(y, size = size, mu = mu, log = T)) 
+    + length(y) * log(1 - dnbinom(0, size = size, mu = mu)))
+}
+
+# cdf
+pztnb <- function(theta, y_i) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  ((pnbinom(y_i, size = size, mu = mu) - dnbinom(0, size = size, mu = mu)) /
+      (1 - dnbinom(0, size = size, mu = mu)))
+}
+
+# inverse cdf
+qztnb <- function(theta, p) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  p_nb <- p + (1 - p) * dnbinom(0, size = size, mu = mu)
+  qnbinom(p_nb, size = size, mu = mu)
+}
+
+# fit a vector to a ztzb
+# take only the bottom 99%, excluding the top 1%
+fit_ztnb <- function(score_vector){
+  score_vector_99 <- score_vector[
+    score_vector < quantile(score_vector, probs = 0.99)
+    ]
+  optim(c(10, 100), lldztnb, y = score_vector_99, control = list(maxit = 1e6))
+}
+```
+
+## Read flu genome and annotations
+```{r, message=FALSE}
+flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/",
+                        "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/",
+                             "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_genome <- Biostrings::readDNAStringSet(flu_genome_file) 
+flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) 
+```
+
+## Read in coverage of all flu LTM and CHX samples
+```{r, message=FALSE}
+cvg <- list.files("../coverage", full.names = T, recursive = T) %>% 
+  # get covearge file
+  str_subset("flu.+pooled.tsv.gz$") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "[^/\\.]+(?=\\.flu)")) %>% 
+  enframe("sample", "file") %>%
+  # exclude mrna samples
+  filter(!str_detect(file, "mrna")) %>% 
+  # include only virus samples
+  filter(str_detect(file, "vir")) %>% 
+  mutate(data = map(file, function(x) suppressMessages(read_tsv(x, na = "")))) %>%
+  select(-file) %>%
+  unnest() %>%
+  mutate(sample = as.factor(sample)) %>%
+  mutate(score = as.integer(round(score))) %>% 
+  filter(score > 0) %>% 
+  # convert each range of length > 1 to a sequence of ranges of length 1
+  mutate(pos = map2(start, end, function(x, y) seq(x, y)))  %>% 
+  unnest() %>% 
+  mutate(start = pos, end = pos) %>% 
+  select(-pos) %>% 
+  # combine NP reads from NP, NPhighCTG
+  mutate(seqname = if_else(str_detect(seqname, "NP"), "NP", seqname)) %>% 
+  group_by(seqname, sample, start, end) %>% 
+  summarize(score = sum(score)) %>% 
+  ungroup() %>% 
+  rename(gene_name = seqname) %>% 
+  # get only + strand reads
+  filter(strand == "+") %>% 
+  select(gene_name, sample, start, end, score, strand) %>% 
+  print()
+```
+
+## Fit ZTNB for each gene that has > 50 non-zero P-sites
+```{r, message=F, warning=F}
+cvg_local_threshold <- cvg %>% 
+  group_by(sample, gene_name) %>%
+  mutate(n_psites = n()) %>% 
+  ungroup() %>% 
+  group_by(sample, gene_name, n_psites) %>% 
+  nest() %>% 
+  mutate(local_ztnb_model = if_else(n_psites > 50, 
+                                    map(data, function(df) fit_ztnb(df[['score']])), 
+                                    as.list(NA))) %>% 
+  unnest(data, .drop = F) %>% 
+  mutate(local_ztnb_fit = map2(
+    local_ztnb_model, score,
+    function(model, score) dztnb(model$par, score))) %>% 
+  mutate(local_ztnb_pvalue = map2(
+    local_ztnb_model, score,
+    function(model, n) {
+      if (is.atomic(model)) {
+        0
+      } else {
+        1 - pztnb(model$par, n) 
+      }
+    })) %>% 
+  unnest(local_ztnb_pvalue, local_ztnb_fit) %>% 
+  print()
+```
+
+
+## Function for select local peak among LTM sites that are less than 15nt apart
+```{r, message=F}
+assign_local_peaks <- function(df) {
+  local_maximum <- rep(T, nrow(df))
+  distance_from_current_peak <- 0
+  current_max_loc <- 1
+  # iterate through rows of dataframe sorted by ascending position
+  for (i in seq(nrow(df))) {
+    # find distance to next non-zero score site
+    distance_to_next <- df[[i, "distance_to_next"]]
+    # if the current peak location (calculated in previous iteration) is within a window size
+    # compare this position to the current peak
+    if (distance_from_current_peak <= window_size) {
+      # if this position score is less than the current peak,
+      # this is not a maxiumum
+      # reset the distance to current peak if the next score site is within
+      if(df[[i, 'ltm_score']] < df[[current_max_loc, 'ltm_score']]) {
+        local_maximum[i] <- F
+        # check that this is not the last peak (distance to next is NA)
+        # if nexxt position is within a window of 15 nt, add the distance
+        # if not, assign the distance to next peak for examining in next loop
+        if (!is.na(distance_to_next) &
+            distance_from_current_peak + distance_to_next <= window_size) {
+          distance_from_current_peak <- distance_from_current_peak + distance_to_next
+        } else {
+          distance_from_current_peak <- distance_to_next
+        }
+      } else {
+        # update the location of the peak if the current score is larger
+        # than tracked score
+        local_maximum[current_max_loc] <- F
+        local_maximum[i] <- T
+        current_max_loc <- i
+        distance_from_current_peak <- distance_to_next
+      }
+    } else {
+      distance_from_current_peak <- distance_to_next
+      local_maximum[i] <- T
+      current_max_loc <- i
+    }
+  }
+  df %>% mutate(is_local_peak = local_maximum)
+}
+```
+
+## Print final list of called flu sites and write to file
+```{r, message=F, warning=F}
+cvg_local_peaks <- cvg_local_threshold %>% 
+  select(-local_ztnb_model, -n_psites,
+         -local_ztnb_fit) %>% 
+  mutate(drug = str_extract(sample, "ltm|cyclo")) %>% 
+  mutate(sample = str_match(sample, "(ltm|cyclo)_(.+)")[,3]) %>% 
+  gather(valuetype, value, matches("score|pvalue")) %>% 
+  unite(valuetype, drug, valuetype) %>% 
+  spread(valuetype, value) %>%
+  filter(ltm_local_ztnb_pvalue < local_pvalue_threshold) %>% 
+  arrange(gene_name, start) %>% 
+  group_by(sample, gene_name) %>% 
+  mutate(distance_to_next = lead(start) - start) %>% 
+  nest() %>% 
+  mutate(data = map(data, assign_local_peaks)) %>% 
+  unnest(data) %>% 
+  ungroup() %>% 
+  filter(is_local_peak == T & 
+           cyclo_score > 1 &
+           ltm_local_ztnb_pvalue < local_pvalue_threshold &
+           (cyclo_ltm_p_ratio * ltm_local_ztnb_pvalue  < cyclo_local_ztnb_pvalue | 
+              ltm_local_ztnb_pvalue < 1e-7)) %>% 
+  select(-distance_to_next, -is_local_peak) %>% 
+  mutate_at(vars(ends_with("pvalue")), funs(as.character(formatC(., format = "e", digits = 0)))) %>% 
+  write_tsv("../tables/raw_list_flu_called_tis.tsv.gz")
+
+cvg_local_peaks %>% 
+  arrange(gene_name, start) %>% 
+  knitr::kable()
+```
+
+## Plot gene-specific ZTNB fit
+```{r, message=F, fig.width=3.9, fig.height=6, warning=F}
+local_fit <- cvg_local_threshold %>% 
+  group_by(sample, score, gene_name) %>% 
+  mutate(n = n()) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  group_by(sample, gene_name) %>% 
+  mutate(local_ztnb_fit = sum(n) * local_ztnb_fit) %>% 
+  ungroup()  
+    
+plot_data <- local_fit %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) 
+
+# highlight called TIS
+highlight_data <- cvg_local_peaks %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample])) %>% 
+  mutate(y = 1, yend = 1)
+
+plot_data %>%
+  ggplot(aes(x = score/100 , color = treatment)) +
+  facet_wrap(~ sample + gene_name,
+             ncol = 4, scales = "free") +
+  geom_point(aes(y = n, shape = treatment), size = 0.5, alpha = 1) +
+  geom_line(aes(y = local_ztnb_fit), size = 0.25, alpha = 1, show.legend = F) +
+  geom_point(data = highlight_data, aes(x = ltm_score/100, y = y), 
+             color = "grey", shape = 2, show.legend = F) +
+  # geom_point(data = highlight_data, aes(x = cyclo_score/100, y = y), 
+  #            color = "grey", shape = 1) +
+  # geom_curve(data = highlight_data,
+  #           aes(x = cyclo_score,
+  #               xend = ltm_score,
+  #               y = y,
+  #               yend = yend, group = start),
+  #           color = "grey", size = 0.5, curvature = -0.5) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  scale_y_log10(limits = c(0.8, NA)) +
+  scale_color_manual(values = cbPalette[2:5]) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  labs(y = "number of sites", x = "pooled counts per site (x102)", color = "") +
+  theme(legend.position = "top", legend.direction = "vertical",
+        panel.spacing.x = unit(0.1, "in")) 
+
+ggsave("../figures/ztnb_fits_individual_genes_flu.pdf")
+```

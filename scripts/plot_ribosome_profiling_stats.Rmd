@@ -1,0 +1,340 @@
+---
+title: "plot_ribosome_profiling_stats"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=F}
+# for string concatenation
+library(glue)
+# for string analysis
+library(stringr)
+# for reading annotation and coverage file formats
+library(rtracklayer)
+# for handling htseq alignments
+library(GenomicAlignments)
+# for handling genomic annotations
+library(GenomicFeatures)
+# for converting between bioconductor and tidyverse
+library(biobroom)
+# for biconductor tidyverse interface
+library(plyranges)
+# for munging data
+library(tidyverse)
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+
+reference_names <- c(gencode = "human", flu = "flu")
+
+min.read.density <- 0.33  # reads / nt, only cds above this used for codon density
+left_overhang_for_start_profile <- 30
+right_overhang_for_start_profile <- 30
+# use this to remove alignments that are at the upper end of read length
+# and potentially without adapters
+max_read_length_cutoff <- 39
+```
+
+## Plotting defaults
+```{r, message=F}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", 
+    "#D55E00", "#F0E442")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8),
+  axis.line = element_line(size=.25),
+  plot.title = element_text(size = 8, hjust = 0.5)
+))
+```
+
+## Read in flu genome and annotations
+```{r, message=F}
+flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                        "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                             "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_genome <- Biostrings::readDNAStringSet(flu_genome_file) 
+flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) 
+```
+
+## Get all CDS and tx
+```{r}
+flu_cds <- flu_annotations %>% 
+  filter(type == "CDS") %>% 
+  split(.$transcript_id) 
+
+flu_tx <- flu_annotations %>% 
+  filter(type == "exon") %>% 
+  split(.$transcript_id) 
+
+flu_cds_annotations <- flu_annotations %>% 
+  filter(type == "CDS") %>% 
+  tidy() %>% 
+  group_by(transcript_id) %>% 
+  summarize(cds_length = sum(width), gene_id = first(gene_id), gene_name = first(gene_id)) %>% 
+  print()
+```
+
+## Read in flu starts, extend to either side, convert to transcript coords
+```{r, message=F}
+extended_flu_starts_tx <- flu_annotations %>% 
+  filter(type == "start_codon") %>% 
+  mapToTranscripts(flu_tx) %>% 
+  mutate(strand = "+") %>% 
+  # extend to either side for plotting
+  promoters(upstream = left_overhang_for_start_profile, 
+            downstream = right_overhang_for_start_profile) %>% 
+  tidy() %>% 
+  # create a single row for each nt on either side of the start codon
+  mutate(pos = map2(start, end, function(x, y) seq(x, y)))  %>% 
+  unnest() %>% 
+  mutate(loc = pos - start) %>% 
+  mutate(start = pos, end = pos) %>% 
+  dplyr::select(-strand, -pos, -width, -transcriptsHits, -xHits) %>% 
+  print()
+```
+
+## Read in all flu alignments
+```{r, warning=F}
+bamfilelist <- list.files("../processeddata", full.names = T, recursive = T,
+                            pattern = "flu.genome.sorted.bam$") %>% 
+  # only +vir samples
+  str_subset("vir") %>% 
+  # only cyclo or ltm
+  str_subset("(cyclo|ltm)")
+  
+
+samplenames <- str_extract(bamfilelist, "(?<=processeddata/{1,2})[^/]+")
+
+### Calculate trimmed and weighted read coverage over genome
+# retrieve alignments along with the RSEM posterior probability
+aln <- bamfilelist %>% 
+  # read in all alignments
+  map(.  %>% readGAlignments(param = ScanBamParam(tag = 'ZW'))) %>% 
+  # assign sample names
+  map2(samplenames, function(aln, name) plyranges::mutate(aln, sample = name)) %>% 
+  # convert list of galignments to galignmentslist
+  GAlignmentsList() %>% 
+  # convert to named galignments for each manipulation
+  unlist() 
+      
+mcols(aln)$qwidth <- qwidth(aln)
+```
+
+## Plot length distribution of flu alignments
+```{r, fig.width=2, fig.height=1.6}
+aln %>% 
+  GRanges() %>% 
+  tidy() %>% 
+  filter(strand == "+") %>% 
+  filter(qwidth <= max_read_length_cutoff) %>% 
+  group_by(sample, qwidth) %>% 
+  summarize(score = sum(ZW)) %>% 
+  ungroup() %>% 
+  group_by(sample) %>% 
+  mutate(score = score / sum(score) * 100) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  ggplot(aes(x = qwidth, y = score, color = treatment)) +
+  facet_wrap(~ sample, ncol = 2, scales = "free") +
+  geom_line() +
+  geom_point(size = 0.8) + 
+  scale_color_manual(values = cbPalette[2:4]) +
+  scale_x_continuous(breaks = seq(26, 38, 4)) +
+  scale_y_continuous(limits = c(0, 18), breaks = seq(0, 15, 5)) +
+  labs(x = "alignment length (nt)", y = "read count %", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "horizontal",
+        legend.box.margin = margin(b = -15)) 
+
+ggsave('../figures/distribution_of_alignment_lengths_flu.pdf')
+```
+
+## Same plots as above but for -ve sense strands
+
+```{r, fig.width=2, fig.height=1.6}
+aln %>% 
+  GRanges() %>% 
+  tidy() %>% 
+  filter(qwidth <= max_read_length_cutoff) %>%
+  group_by(sample, qwidth, strand) %>% 
+  summarize(score = sum(ZW)) %>% 
+  ungroup() %>% 
+  group_by(sample, strand) %>% 
+  mutate(score = score / sum(score) * 100) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  filter(strand == "-" & str_detect(sample, "vir") & treatment != "mrna") %>% 
+  ggplot(aes(x = qwidth, y = score, color = treatment)) +
+  facet_wrap(~ sample, ncol = 2, scales = "free") +
+  geom_line() +
+  geom_point(size = 0.8) + 
+  scale_color_manual(values = cbPalette[2:4]) +
+  scale_y_continuous(limits = c(0, 12), breaks = seq(0,12,4)) +
+  scale_x_continuous(breaks = seq(26,39,4)) +
+  labs(x = "alignment length (nt)", y = "read count %", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "horizontal",
+        legend.box.margin = margin(b = -15)) +
+
+ggsave('../figures/distribution_of_alignment_lengths_flu_both_samples_minus_strand.pdf',
+    width = 2, height = 1.6)
+```
+
+## Plot proportion of alignments to flu and human transcripts
+```{r}
+cvg <- list.files("../coverage", full.names = T, recursive = T) %>% 
+  # get covearge file
+  str_subset("(gencode|flu).+tsv.gz$") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "[^/\\.]+\\.(gencode|flu)")) %>% 
+  enframe("sample", "file") %>%
+  # exclude deblurred or pooled samples
+  filter(!str_detect(file, "deblurred|pooled")) %>% 
+  # exclude -ve sense flu samples
+  filter(!str_detect(file, "flu.+minus")) %>% 
+  mutate(data = map(file, function(x) suppressMessages(read_tsv(x, na = "")))) %>%
+  select(-file) %>%
+  unnest() %>%
+  mutate(sample = as.factor(sample)) %>%
+  mutate(reference = str_extract(sample, "gencode|flu")) %>% 
+  mutate(sample = str_extract(sample, ".+(?=\\.(gencode|flu))")) %>% 
+  print()
+```
+
+## Print proportion of reads aligning to flu/gencode for each sample
+```{r, fig.width = 6, height = 3.2}
+plot_data %>% print(n=24)
+```
+
+
+```{r, fig.width = 6, height = 3.2}
+plot_data <- cvg %>% 
+  group_by(sample, reference) %>%
+  summarize(counts = sum(score)) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>%
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>%
+  mutate(sample = sample_names[sample], 
+         treatment = treatment_names[treatment], 
+         reference = reference_names[reference]) %>%
+  group_by(sample, treatment) %>% 
+  mutate(proportion = counts / sum(counts) * 100) %>% 
+  ungroup() 
+
+
+plot_data %>% 
+  mutate(reference = forcats::fct_rev(reference)) %>% 
+  mutate(treatment = forcats::fct_rev(treatment)) %>% 
+  mutate(sample = forcats::fct_relevel(sample, "ctrl", "+ifn", "+vir")) %>% 
+  ggplot(aes(x = treatment, y = proportion, fill = reference)) +
+  facet_wrap(~ sample, ncol = 1, strip.position = "right") +
+  geom_col(width = 0.8, color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = c("white", "black")) +
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_text(margin=margin(0,-2,0,0)),
+        strip.text.y = element_text(angle=0, hjust = 0, margin=margin(0,0,0,0)),
+        legend.key.height = unit(10, "pt"), legend.position = "top",
+        legend.box.margin = margin(0, 0, -10, 0),
+        legend.box = "horizontal") +
+  guides(fill = guide_legend(reverse = T)) +
+  labs(y = "aligned reads (%)", x = "", fill = "")
+
+plot.width = 1.6
+plot.height = 3
+
+ggsave(glue('../figures/read_proportion.pdf'), 
+       width = plot.width, height = plot.height, 
+       units = 'in')
+```
+
+
+## Read in all host alignments for plotting distribution of read lengths
+```{r, warning=F}
+bamfilelist <- list.files("../processeddata", full.names = T, recursive = T,
+                            pattern = "gencode.genome.sorted.bam$") %>% 
+  # # only +vir samples
+  # str_subset("(?<!ifn_)vir") %>% 
+  # only cyclo or ltm
+  str_subset("(cyclo|ltm)")
+  
+
+samplenames <- str_extract(bamfilelist, "(?<=processeddata/{1,2})[^/]+")
+
+### Calculate trimmed and weighted read coverage over genome
+# retrieve alignments along with the RSEM posterior probability
+aln <- bamfilelist %>% 
+  # read in all alignments
+  map(.  %>% readGAlignments(param = ScanBamParam(tag = 'ZW'))) %>% 
+  # assign sample names
+  map2(samplenames, function(aln, name) plyranges::mutate(aln, sample = name)) %>% 
+  # convert list of galignments to galignmentslist
+  GAlignmentsList() %>% 
+  # convert to named galignments for each manipulation
+  unlist() 
+      
+mcols(aln)$qwidth <- qwidth(aln)
+```
+
+## Plot length distribution of host alignments
+
+```{r, fig.width=4, fig.height=1.6}
+aln %>% 
+  GRanges() %>% 
+  tidy() %>% 
+  filter(qwidth <= max_read_length_cutoff) %>%
+  group_by(sample, qwidth) %>% 
+  summarize(score = sum(ZW)) %>% 
+  ungroup() %>% 
+  group_by(sample) %>% 
+  mutate(score = score / sum(score) * 100) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  ggplot(aes(x = qwidth, y = score, color = treatment)) +
+  facet_wrap(~sample, ncol = 4, scales = "free_y") +
+  geom_line() +
+  geom_point(size = 0.8) + 
+  scale_color_manual(values = cbPalette[2:4]) +
+  scale_x_continuous(limits = c(25, 39), breaks = seq(26, 38, 4)) +
+  scale_y_continuous(limits = c(0, 13), breaks = seq(0, 12, 4)) +
+  labs(x = "alignment length (nt)", y = "read count %", shape = "", color = "") +
+  theme(legend.position = "top", 
+        legend.direction = "horizontal",
+        legend.box.margin = margin(b = -15)) 
+
+ggsave('../figures/distribution_of_alignment_lengths_host.pdf')
+```

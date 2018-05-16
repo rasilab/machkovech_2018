@@ -1,0 +1,417 @@
+---
+title: "Analyze flu called start sites"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=F}
+library(Biostrings)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(BSgenome)
+library(broom)
+library(biobroom)
+library(glue)
+library(stringr)
+library(grid)
+library(plyranges)
+library(tidyverse)
+
+### plotting defaults
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666","#E69F00", "#56B4E9", 
+               "#009E73", "#CC79A7", "#0072B2", "#D55E00", "#F0E442", "#E99F")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8, face = "bold"),
+  axis.line = element_line(size=.25),
+  axis.text = element_text(color = "black", size = 8)
+))
+
+stop_codons <- GENETIC_CODE %>% 
+  subset(. == "*") %>% 
+  names() 
+
+# use this order to resolve multiple TIS within the same 5nt window
+tis_priority <- seq(11)
+names(tis_priority) <- c("AUG", "CUG", "GUG", "UUG", "AUA", "AUC", "AUU",
+                     "AAG", "ACG", "AGG", "other")
+```
+
+## Read genome and annotations
+```{r, message=F}
+flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                        "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/",
+                             "flu/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_genome <- Biostrings::readDNAStringSet(flu_genome_file) 
+flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) %>% 
+  # to avoid duplicate starts from secondary transcripts
+  filter(!transcript_id %in% c("M2", "NS2"))
+
+flu_cds <- flu_annotations %>% 
+  filter(type == "CDS") %>% 
+  split(.$transcript_id)
+```
+
+## Extract flu transcript annotations
+```{r, message=F}
+flu_tx <- flu_annotations %>% 
+  filter(type == "exon") %>% 
+  split(.$transcript_id)
+```
+
+## Extract flu annotated start codon annotations
+```{r, message=F}
+flu_starts <- flu_annotations %>% 
+  filter(type == "start_codon")
+
+flu_starts_tx <- flu_starts %>% 
+  mapToTranscripts(flu_tx) %>% 
+  mutate(transcript_id = flu_starts$transcript_id[xHits]) %>% 
+  # since each start codon is already annotated with the tx it belongs to,
+  # we can safely ignore the other transcripts that it maps to.
+  filter(seqnames == transcript_id) %>% 
+  tidy() %>% 
+  rename(canonical.start = start, canonical.end = end) %>% 
+  select(transcript_id, canonical.start, canonical.end) %>% 
+  print()
+```
+
+## Extract flu transcript sequences
+```{r, message=F}
+flu_tx_seq <- extractTranscriptSeqs(flu_genome, flu_tx) %>% 
+  print()
+```
+
+## Read in called start sites
+```{r, message=F}
+cvg <- read_tsv("../tables/raw_list_flu_called_tis.tsv.gz", 
+                col_types = c(col_character()), na = "") %>% 
+  mutate(chr.hit = row_number()) %>% 
+  rename(seqname = gene_name) %>% 
+  print()
+```
+
+## Convert called starts to transcriptomic coords from genomic coords
+```{r, message=F}
+cvg_gr <- cvg %>% 
+  GRanges()
+
+cvg_tx <- cvg_gr %>% 
+  GenomicFeatures::mapToTranscripts(flu_tx, ignore.strand = T) %>% 
+  mutate(sample = cvg[["sample"]][xHits]) %>% 
+  mutate(chr = cvg[["seqname"]][xHits]) %>% 
+  mutate(chr.pos = cvg[["start"]][xHits]) %>% 
+  mutate(chr.hit = xHits) %>% 
+  mutate(tx.hit = seq(length(.))) %>% 
+  select(-xHits) %>% 
+  # extend 1nt in 5' side and 4nt in the 3' side (1nt on either side of codon)
+  promoters(upstream = 1, downstream = 4) %>% 
+  # get sequence of this region
+  mutate(seq = subseq(flu_tx_seq[seqnames], start = start, end = end)) %>% 
+  print()
+```
+
+## Find near cognate matches in a window of 5nt around each called start
+```{r, message=F}
+near_cognate_matches <- vmatchPattern("ATG", cvg_tx$seq, max.mismatch = 1) %>% 
+  as("CompressedIRangesList") %>% 
+  as_tibble() %>% 
+  rename(tx.hit = group, seqname = group_name) %>% 
+  filter(start %in% seq(1,3)) %>% 
+  print()
+```
+
+## Extract the near cognate codon from the match
+```{r, message=F}
+near_cognate_match_codon <- subseq(
+  x = cvg_tx$seq[near_cognate_matches[['tx.hit']]],
+  start = near_cognate_matches[['start']],
+  end = near_cognate_matches[['end']]) %>% 
+  as.character() %>% 
+  enframe("sno", "codon") %>%
+  bind_cols(near_cognate_matches) %>% 
+  select(codon) %>% 
+  print()
+```
+
+## Combine the near cognate match location and codon
+```{r, message=F}
+near_cognate_hits <- near_cognate_matches %>% 
+  bind_cols(near_cognate_match_codon) %>% 
+  mutate(codon.start = start) %>% 
+  select(tx.hit, codon.start, codon) %>% 
+  print()
+```
+
+## Join called starts with assigned near cognate codon and their location
+```{r, message=F}
+cvg_tx_with_canonical <- cvg_tx %>%
+  tidy() %>% 
+  left_join(near_cognate_hits, by = "tx.hit") %>% 
+  left_join(flu_starts_tx, by = c("seqname" = "transcript_id")) %>% 
+  mutate(codon = if_else(is.na(codon), "other", codon)) %>% 
+  # convert T to U in codons for plotting
+  mutate(codon = str_replace_all(codon, "T", "U")) %>% 
+  mutate(tis.start = start + codon.start - 1, tis.end = start + codon.start + 1) %>% 
+  mutate(nt_to_atis = tis.start - canonical.start) %>% 
+  mutate(frame = nt_to_atis %% 3) %>% 
+  # get rid of starts that are located at same position in multiple isoforms (for M and NS)
+  group_by(chr, tis.start, tis.end, frame, sample) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  # if there are multiple near cognates in the 6nt window, get a single one
+  # based on the priority order above
+  mutate(codon_priority = tis_priority[codon]) %>% 
+  group_by(sample, chr, seq, start) %>% 
+  arrange(codon_priority) %>% 
+  slice(1) %>% 
+  ungroup() %>%
+  arrange(codon_priority, tis.start - canonical.start, sample)  %>% 
+  select(-canonical.end, -tis.end, -start, -end, -width, -codon.start, 
+         -codon_priority, -tx.hit, -seq) 
+```
+
+## Get peptide and peptide length of TIS, write all TIS annotations to  file
+```{r, message=F}
+# extract the transcript sequence for each called start
+tx_seq_called_starts <- flu_tx_seq[cvg_tx_with_canonical[['seqname']]]
+# truncate the sequence starting from the called start to end of transcript
+truncated <- subseq(tx_seq_called_starts, cvg_tx_with_canonical[['tis.start']], width(tx_seq_called_starts))
+# extract the orf upto the first stop codon
+orfs <- str_extract(truncated, "^([ACTG]{3})+?(TAG|TGA|TAA)")
+# set all non-orfs and non-near cognate start orfs to blank
+orfs[is.na(orfs)] <- ""
+orfs[is.na(cvg_tx_with_canonical[['tis.start']])] <- ""
+# extract peptides
+peptides <- translate(DNAStringSet(orfs))
+peptide_length <- width(peptides) - 1
+# truncate peptides to max length of 30  for ease of viewing
+peptides = subseq(peptides, NA, ifelse(width(peptides) > 30, 30, width(peptides)))
+
+tis <- cvg_tx_with_canonical %>% 
+  mutate(peptide_length = peptide_length, peptide = as.character(peptides)) %>% 
+  write_tsv("../tables/called_flu_tis.tsv.gz")
+
+tis %>% 
+  select(sample, chr, chr.hit, codon, nt_to_atis, frame, peptide_length, peptide) %>% 
+  rename(pep_len = peptide_length, nt_to_atis = nt_to_atis) %>% 
+  left_join(cvg %>% select(chr.hit, ends_with("value"), sample) %>% distinct()) %>% 
+  rename(cyclo_p = cyclo_local_ztnb_pvalue, ltm_p = ltm_local_ztnb_pvalue) %>% 
+  arrange(tis_priority[codon], chr, nt_to_atis) %>% 
+  select(-peptide, everything(), peptide, -chr.hit) %>% 
+  knitr::kable()
+```
+
+## Plot number of near-cognates across all samples
+```{r, message=F, fig.width=2, fig.height=1.6}
+tis %>% 
+  group_by(sample, codon) %>% 
+  summarize(n_start = n()) %>% 
+  mutate(codon_priority = tis_priority[codon]) %>% 
+  ungroup() %>% 
+  mutate(codon = forcats::fct_reorder(factor(codon), codon_priority)) %>% 
+  ggplot(aes(y = n_start, x = sample, fill = codon)) +
+  geom_col() +
+  viridis::scale_fill_viridis(discrete = T, direction = -1) +
+  labs(x = "sample", y = "count", 
+       fill = "TIS identity") 
+
+ggsave('../figures/flu_near_cognate_count.pdf', 
+       device = cairo_pdf)
+```
+
+## Same plot as above but normalized within each sample
+```{r, message=F, fig.width=2, fig.height=1.6}
+tis %>% 
+  group_by(sample, codon) %>% 
+  summarize(n_start = n()) %>% 
+  mutate(codon_priority = tis_priority[codon]) %>% 
+  ungroup() %>% 
+  group_by(sample) %>% 
+  mutate(n_start = n_start / sum(n_start) * 100) %>% 
+  ungroup() %>% 
+  mutate(codon = forcats::fct_reorder(factor(codon), codon_priority)) %>% 
+  ggplot(aes(y = n_start, x = sample, fill = codon)) +
+  geom_col() +
+  viridis::scale_fill_viridis(discrete = T, direction = -1) +
+  labs(x = "sample", y = "proportion (%)", 
+       fill = "TIS identity") 
+
+ggsave('../figures/flu_near_cognate_proportion.pdf', 
+       device = cairo_pdf)
+```
+
+## Same plot as above, but faceted by codon
+```{r, message=F, fig.width=3, fig.height=1.6}
+tis %>% 
+  group_by(sample, codon) %>% 
+  summarize(n_start = n()) %>% 
+  mutate(codon_priority = tis_priority[codon]) %>% 
+  ungroup() %>% 
+  mutate(codon = forcats::fct_reorder(factor(codon), codon_priority)) %>% 
+  ggplot(aes(y = n_start, x = sample, fill = codon)) +
+  geom_col() +
+  facet_wrap(~ codon, ncol = 4, scale = "free_y") +
+  viridis::scale_fill_viridis(discrete = T, direction = -1) +
+  labs(x = "sample", y = "count", 
+       fill = "TIS identity") 
+
+ggsave('../figures/flu_near_cognate_count_faceted_by_codon.pdf', 
+       device = cairo_pdf) 
+```
+
+## Plot how many near-cognate starts overlap between different samples
+```{r, message=F, fig.width=2, fig.height=2}
+plot_data <- tis %>% 
+  select(sample, tis.start, codon, seqname) %>% 
+  unite(start_end_codon_seqname, seqname, tis.start, codon, sep = ":", remove = F) %>%  
+  distinct() %>% 
+  # create a new column with unique number based on sample in which tis was called
+  mutate(is_called = case_when(
+    sample == "ifn_vir" ~ 1,
+    sample == "vir" ~ 2)) %>% 
+  # assign a value of 0 if the tis was not called in a particular sample
+  spread(sample, is_called) %>% 
+  mutate_at(vars(contains("vir")), funs(if_else(is.na(.), 0, .))) %>% 
+  # assign a unique number to each combination of sample
+  mutate(combination = rowSums(select(., contains("vir")))) %>%  
+  mutate_at(vars(contains("vir")), funs(if_else(. == 0, 0, 1))) %>% 
+  mutate(combination = combination + 100 * rowSums(select(., contains("vir")))) %>% 
+  group_by(combination, ifn_vir, vir) %>% 
+  count() %>% 
+  gather(sample, is_called, contains("vir")) %>% 
+  ungroup() %>% 
+  mutate(combination = as.factor(combination))
+
+p <- plot_data %>% 
+  ggplot(aes(x = sample, y = combination, fill = as.logical(is_called))) +
+  geom_tile(color = "black") +
+
+  viridis::scale_fill_viridis(discrete = T) + 
+  labs(y = "number of called TIS\n\n", fill = "is_called",
+       title = "Overlap in called TIS\nbetween samples"
+       ) +
+  theme(
+    panel.spacing = unit(2, "lines"),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(), 
+    axis.line = element_blank(),
+    axis.text.x = element_text(angle = 330, hjust = 0)) +
+  geom_text(aes(x = 0.4, label = n), hjust = 1, size = 3) +
+  scale_x_discrete() 
+
+# Code to override clipping
+gt <- ggplot_gtable(ggplot_build(p))
+gt$layout$clip <- "off"
+grid.draw(gt)
+
+
+ggsave('../figures/flu_near_cognate_overlap_between_samples.pdf', 
+       plot = gt)
+# plot(gt)
+```
+
+## Same plot as above but faceted by the identity of the start site
+```{r, message=F, fig.width=8, fig.height=4}
+plot_data <- tis %>% 
+  select(sample, tis.start, codon, seqname) %>% 
+  unite(start_end_codon_seqname, seqname, tis.start, codon, sep = ":", remove = F) %>%  
+  distinct() %>% 
+  # create a new column with unique number based on sample in which tis was called
+  mutate(is_called = case_when(
+    sample == "ifn_vir" ~ 1,
+    sample == "vir" ~ 2)) %>% 
+  # assign a value of 0 if the tis was not called in a particular sample
+  spread(sample, is_called) %>% 
+  mutate_at(vars(contains("vir")), funs(if_else(is.na(.), 0, .))) %>% 
+  # assign a unique number to each combination of sample
+  mutate(combination = rowSums(select(., contains("vir")))) %>%  
+  mutate_at(vars(contains("vir")), funs(if_else(. == 0, 0, 1))) %>% 
+  mutate(combination = combination + 100 * rowSums(select(., contains("vir")))) %>% 
+  group_by(combination, ifn_vir, vir, codon) %>% 
+  count() %>% 
+  gather(sample, is_called, contains("vir")) %>% 
+  ungroup() %>% 
+  mutate(combination = as.factor(combination)) %>% 
+  mutate(n_codon = tis_priority[codon])
+
+p <- plot_data %>% 
+  ggplot(aes(x = sample, y = combination, fill = as.logical(is_called))) +
+  geom_tile(color = "black") +
+  facet_wrap(~ forcats::fct_reorder(codon, n_codon, .desc = F), ncol = 4, scales = "free") +
+
+  viridis::scale_fill_viridis(discrete = T) + 
+  labs(y = "number of called TIS\n\n", fill = "is_called",
+       title = "Overlap in called TIS between samples, faceted by codon"
+       ) +
+  theme(
+    panel.spacing = unit(2, "lines"),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(), 
+    axis.line = element_blank(),
+    axis.text.x = element_text(angle = 330, hjust = 0)) +
+  geom_text(aes(x = 0.4, label = n), hjust = 1, size = 3) +
+  scale_x_discrete() 
+
+# Code to override clipping
+gt <- ggplot_gtable(ggplot_build(p))
+gt$layout$clip <- "off"
+grid.draw(gt)
+
+ggsave('../figures/flu_near_cognate_overlap_between_samples_faceted_by_codon.pdf', 
+       plot = gt, device = cairo_pdf)
+```
+
+## Write called TIS sorted by sample and codon identity to table for visual inspection
+```{r, message=F}
+plot_data <- tis %>% 
+  select(sample, tis.start, codon, seqname) %>% 
+  unite(start_end_codon_seqname, seqname, tis.start, codon, sep = ":", remove = F) %>%  
+  distinct() %>% 
+  # create a new column with unique number based on sample in which tis was called
+  mutate(is_called = case_when(
+    sample == "ifn_vir" ~ 1,
+    sample == "vir" ~ 2)) %>% 
+  # assign a value of 0 if the tis was not called in a particular sample
+  spread(sample, is_called) %>% 
+  mutate_at(vars(contains("vir")), funs(if_else(is.na(.), 0, .))) %>% 
+  # assign a unique number to each combination of sample
+  mutate(combination = rowSums(select(., contains("vir")))) %>%  
+  mutate_at(vars(contains("vir")), funs(if_else(. == 0, 0, 1))) %>% 
+  mutate(combination = combination + 100 * rowSums(select(., contains("vir")))) %>% 
+  gather(sample, is_called, contains("vir")) %>% 
+  filter(is_called > 0) %>% 
+  mutate(is_called = sample) %>% 
+  spread(sample, is_called) %>% 
+  mutate_at(vars(contains("vir")), funs(if_else(is.na(.), "", as.character(.)))) %>% 
+  unite(called_in, contains("vir"), sep = "") %>% 
+  mutate(called_in = if_else(called_in == "ifn_virvir", "both", called_in)) %>% 
+  arrange(tis_priority[codon], desc(combination, seqname, tis.start)) %>% 
+  select(called_in, everything()) %>% 
+  left_join(tis %>% 
+            select(tis.start, seqname, frame, peptide_length, nt_to_atis, peptide, chr.hit) %>% 
+            distinct()) %>% 
+  select(-start_end_codon_seqname, -combination, -tis.start) %>% 
+  rename(pep_len = peptide_length, nt_to_atis = nt_to_atis) %>% 
+  mutate_if(is.double, as.integer) %>% 
+  left_join(cvg %>% select(chr.hit, ends_with("value"), sample) %>% distinct(),
+            by = "chr.hit") %>% 
+  rename(cyclo_p = cyclo_local_ztnb_pvalue, ltm_p = ltm_local_ztnb_pvalue) %>% 
+  select(-chr.hit) %>% 
+  mutate_at(vars(ends_with("_p")), funs(as.character(formatC(., format = "e", digits = 0)))) %>% 
+  write_tsv("../tables/called_flu_tis_for_viewing.tsv")
+```

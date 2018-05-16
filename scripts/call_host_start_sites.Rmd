@@ -1,0 +1,357 @@
+---
+title: "Call host start sites"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+params:
+  samplename: "untr"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F)
+```
+
+Criteria used for calling start sites below:
+
+1.  LTM peak is a gene-specific outlier with p<=0.01 for a ZTNB fit for bottom 99% detected P sites in *each gene*.
+
+2.  CHX must have non-zero counts.
+
+3.  The gene-specific ZTNB P value for the peak should be 100-fold lower for LTM fit over CHX fit OR the absolute LTM P value should be less than 1e-7.
+
+4.  LTM peak is a local maxima when considering other peaks 15nt upstream or downstream.
+
+5.  The LTM count must have p <= 0.05 based on a global ZTNB fit to the LTM data.
+
+## Load libraries and define analysis-specific parameters
+```{r}
+library(GenomicFeatures)
+library(stringr)
+library(broom)
+library(biobroom)
+library(glue)
+library(grid)
+library(scales)
+library(rasilabRtemplates)
+library(plyranges)
+library(tidyverse)
+
+samplename <- params$samplename
+
+# called sites criteria
+global_pvalue_threshold <- 0.05
+local_pvalue_threshold <- 0.01
+cyclo_ltm_p_ratio <- 1000
+window_size <- 15
+absolute_ltm_pvalue_threshold <- 1e-7
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+```
+
+## Zero-truncated negative binomial definitions
+```{r}
+# ZTNB is a negative binomial normalized by (1 - P(yi = 0))
+# I am using the mu, alpha (1/size) parametrization:
+# https://en.wikipedia.org/wiki/Negative_binomial_distribution#Alternative_formulations
+
+# probablilty density
+dztnb <- function(theta, y) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  dnbinom(y, size = size, mu = mu) / (1 - dnbinom(0, size = size, mu = mu))
+}
+
+# negative log likelihood
+lldztnb <- function(theta, y) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  (- sum(dnbinom(y, size = size, mu = mu, log = T)) 
+    + length(y) * log(1 - dnbinom(0, size = size, mu = mu)))
+}
+
+# cdf
+pztnb <- function(theta, y_i) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  ((pnbinom(y_i, size = size, mu = mu) - dnbinom(0, size = size, mu = mu)) /
+      (1 - dnbinom(0, size = size, mu = mu)))
+}
+
+# inverse cdf
+qztnb <- function(theta, p) {
+  size <- 1/theta[1]
+  mu <- theta[2]
+  p_nb <- p + (1 - p) * dnbinom(0, size = size, mu = mu)
+  qnbinom(p_nb, size = size, mu = mu)
+}
+
+# fit a vector to a ztzb
+# take only the bottom 99%, excluding the top 1%
+fit_ztnb <- function(score_vector){
+  score_vector_99 <- score_vector[
+    score_vector < quantile(score_vector, probs = 0.99)
+    ]
+  optim(c(10, 100), lldztnb, y = score_vector_99, control = list(maxit = 1e6))
+}
+```
+
+## Read host genome and annotations
+```{r}
+genome <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+annotations <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/human/hg38/",
+                    "gencode/annotations//gencode.v24.annotation.gff3.gz")
+annotations <- rtracklayer::import.gff3(annotations)
+```
+
+## Get genes
+```{r}
+genes <- annotations %>% 
+  filter(type == "gene" & gene_type == "protein_coding") %>% 
+  setNames(.$gene_id)
+```
+
+## Get longest CDS
+```{r}
+longest_cds <- annotations %>% 
+  filter(type == "CDS") %>% 
+  tidy() %>% 
+  group_by(gene_id) %>% 
+  # remove chrY if there is also a chrX for the same gene_id
+  mutate(n_seqnames = n_distinct(seqname)) %>% 
+  mutate(include = if_else(seqname == "chrY" & n_seqnames > 1, F, T)) %>% 
+  ungroup() %>% 
+  filter(include == T) %>% 
+  GRanges() %>% 
+  split(.$gene_id) %>% 
+  GenomicRanges::reduce()
+```
+
+## Get longest CDS length for each gene
+```{r}
+longest_cds_length <- longest_cds %>% 
+  tidy() %>% 
+  group_by(item) %>% 
+  summarize(longest_cds_length = sum(width))
+
+gene_annotations <- annotations %>% 
+  filter(type == "gene") %>% 
+  tidy() %>%
+  select(gene_id, gene_name) %>% 
+  distinct() %>% 
+  inner_join(longest_cds_length, by = c("gene_id" = "item")) %>% 
+  print()
+```
+
+## Read in coverage of all host LTM and CHX samples
+```{r}
+cvg <- list.files("../coverage/", full.names = T, recursive = T) %>% 
+  # get covearge file
+  str_subset("gencode.+pooled.tsv.gz$") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "[^/\\.]+(?=\\.gencode)")) %>% 
+  enframe("sample", "file") %>%
+  # exclude mrna samples
+  # subset to samplename passed as parameter to the file
+  filter(str_detect(sample, glue("(cyclo|ltm)_{samplename}$"))) %>% 
+  mutate(data = map(file, function(x) suppressMessages(read_tsv(x, na = "")))) %>%
+  select(-file) %>%
+  unnest() %>%
+  mutate(sample = as.factor(sample)) %>%
+  mutate(score = as.integer(round(score))) %>% 
+  filter(score > 0) %>% 
+  # convert each range of length > 1 to a sequence of ranges of length 1
+  mutate(pos = map2(start, end, function(x, y) seq(x, y)))  %>% 
+  unnest() %>% 
+  mutate(start = pos, end = pos) %>% 
+  select(-pos) %>% 
+  dplyr::select(seqname, sample, start, end, score, strand) %>% 
+  print()
+```
+
+## Calculate global threshold for each sample based on ZTNB fit
+```{r}
+global_count_threshold <- cvg %>% 
+  group_by(sample) %>%
+  mutate(n_psites = n()) %>% 
+  ungroup() %>% 
+  group_by(sample, n_psites) %>% 
+  nest() %>% 
+  mutate(global_ztnb_model = map(data, function(df) fit_ztnb(df[['score']]))) %>%
+  mutate(global_count_threshold = map(
+    global_ztnb_model, 
+    function(model) qztnb(model$par, 1 - global_pvalue_threshold))) %>% 
+  unnest(global_count_threshold) %>% 
+  select(sample, global_count_threshold) %>%
+  print()
+```
+
+## Convert coverage to transcript coords for fitting gene-specific ZTNB
+```{r}
+cvg_gr <- cvg %>% 
+  GRanges()
+
+names(cvg_gr) <- seq_along(cvg_gr)
+
+cvg_tx <- cvg_gr %>% 
+  GenomicFeatures::mapToTranscripts(genes) %>% 
+  tidy() %>% 
+  dplyr::select(seqname, xHits) %>% 
+  rename(gene_id = seqname) %>% 
+  group_by(xHits) %>% 
+  mutate(n_genes = n()) %>% 
+  ungroup() %>% 
+  filter(n_genes == 1) 
+
+cvg_tx <- cvg_gr %>% 
+  tidy() %>% 
+  rename(xHits = names) %>%
+  mutate(xHits = as.integer(xHits)) %>% 
+  inner_join(cvg_tx %>% dplyr::select(xHits, gene_id), by = 'xHits') %>% 
+  inner_join(gene_annotations, by = 'gene_id') %>% 
+  print()
+```
+
+## Choose high coverage transcripts for testing code
+```{r}
+high_cvg_tx <- cvg_tx %>% 
+  group_by(sample, gene_id) %>% 
+  summarize(score = sum(score)) %>% 
+  ungroup() %>% 
+  left_join(gene_annotations, by = c("gene_id")) %>% 
+  arrange(score) %>% 
+  filter(longest_cds_length > 100) %>% 
+  dplyr::slice(1:5000) %>% 
+  distinct(gene_id) %>% 
+  pull(gene_id) 
+```
+
+## Fit ZTNB for each gene that has &gt; 50 non-zero P-sites
+```{r}
+cvg_local_threshold <- cvg_tx %>% 
+  # comment line below if you are not testing code
+  # filter(gene_id %in% high_cvg_tx) %>%
+  group_by(sample, gene_id) %>%
+  mutate(n_psites = n()) %>% 
+  ungroup() %>% 
+  group_by(sample, gene_id, n_psites) %>% 
+  nest() %>% 
+  mutate(local_ztnb_model = if_else(n_psites > 50, 
+                                    map(data, function(df) fit_ztnb(df[['score']])), 
+                                    as.list(NA))) %>% 
+  unnest(data, .drop = F) %>% 
+  mutate(local_ztnb_fit = map2(
+    local_ztnb_model, score,
+    function(model, n) {
+      if (is.atomic(model)) {
+        n
+      } else {
+        dztnb(model$par, n)
+      }
+    })) %>%
+  mutate(local_ztnb_pvalue = map2(
+    local_ztnb_model, score,
+    function(model, n) {
+      if (is.atomic(model)) {
+        0
+      } else {
+        1 - pztnb(model$par, n) 
+      }
+    })) %>% 
+  unnest(local_ztnb_pvalue, local_ztnb_fit) %>%
+  print()
+```
+
+## Function to select local peak among LTM sites that are less than 15nt apart
+```{r}
+assign_local_peaks <- function(df) {
+  local_maximum <- rep(T, nrow(df))
+  distance_from_current_peak <- 0
+  current_max_loc <- 1
+  # iterate through rows of dataframe sorted by ascending position
+  for (i in seq(nrow(df))) {
+    # find distance to next non-zero score site
+    distance_to_next <- df[[i, "distance_to_next"]]
+    # if the current peak location (calculated in previous iteration) is within a window size
+    # compare this position to the current peak
+    if (distance_from_current_peak <= window_size) {
+      # if this position score is less than the current peak,
+      # this is not a maxiumum
+      # reset the distance to current peak if the next score site is within
+      if(df[[i, 'ltm_score']] < df[[current_max_loc, 'ltm_score']]) {
+        local_maximum[i] <- F
+        # check that this is not the last peak (distance to next is NA)
+        # if nexxt position is within a window of 15 nt, add the distance
+        # if not, assign the distance to next peak for examining in next loop
+        if (!is.na(distance_to_next) &
+            distance_from_current_peak + distance_to_next <= window_size) {
+          distance_from_current_peak <- distance_from_current_peak + distance_to_next
+        } else {
+          distance_from_current_peak <- distance_to_next
+        }
+      } else {
+        # update the location of the peak if the current score is larger
+        # than tracked score
+        local_maximum[current_max_loc] <- F
+        local_maximum[i] <- T
+        current_max_loc <- i
+        distance_from_current_peak <- distance_to_next
+      }
+    } else {
+      distance_from_current_peak <- distance_to_next
+      local_maximum[i] <- T
+      current_max_loc <- i
+    }
+  }
+  df %>% mutate(is_local_peak = local_maximum)
+}
+```
+
+## Print final list of called host sites and write to file
+
+The `filter` steps below implement the different start site calling criteria mentioned at the top of the page.
+
+```{r}
+cvg_local_peaks <- cvg_local_threshold %>% 
+  # global count threshold implementation
+  left_join(global_count_threshold, by = "sample") %>% 
+  dplyr::select(-local_ztnb_model, -n_psites,
+         -local_ztnb_fit, -xHits) %>% 
+  mutate(drug = str_extract(sample, "ltm|cyclo")) %>% 
+  mutate(sample = str_match(sample, "(ltm|cyclo)_(.+)")[,3]) %>% 
+  gather(valuetype, value, matches("score|pvalue|threshold")) %>% 
+  unite(valuetype, drug, valuetype) %>% 
+  spread(valuetype, value) %>%
+  filter(ltm_local_ztnb_pvalue < local_pvalue_threshold) %>%
+  arrange(gene_id, start) %>% 
+  group_by(sample, gene_id) %>% 
+  mutate(distance_to_next = lead(start) - start) %>% 
+  nest() %>% 
+  mutate(data = map(data, assign_local_peaks)) %>% 
+  unnest(data) %>% 
+  ungroup() %>% 
+  write_tsv(glue("../tables/unfiltered_list_host_called_tis_{samplename}.tsv.gz")) %>% 
+  # implement all the start site calling criteria here
+  filter(is_local_peak == T & 
+           ltm_score >= ltm_global_count_threshold &
+           ltm_local_ztnb_pvalue < local_pvalue_threshold &
+           (!is.na(cyclo_score) &
+           cyclo_ltm_p_ratio * ltm_local_ztnb_pvalue  < cyclo_local_ztnb_pvalue | 
+              ltm_local_ztnb_pvalue <= absolute_ltm_pvalue_threshold)) %>% 
+  dplyr::select(-distance_to_next, -is_local_peak, -width, -strand) %>% 
+  mutate_at(vars(ends_with("pvalue")), funs(as.character(formatC(., format = "e", digits = 0)))) %>% 
+  write_tsv(glue("../tables/raw_list_host_called_tis_{samplename}.tsv.gz")) %>% 
+  print()
+```

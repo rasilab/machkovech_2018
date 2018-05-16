@@ -1,0 +1,282 @@
+---
+title: "Analyze host called start sites"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  github_document:
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+## Import libraries
+```{r}
+library(Biostrings)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(BSgenome)
+library(broom)
+library(biobroom)
+library(glue)
+library(stringr)
+library(grid)
+library(plyranges)
+library(tidyverse)
+library(rasilabRtemplates)
+
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+# use this order to resolve multiple TIS within the same 5nt window
+tis_priority <- seq(11)
+names(tis_priority) <- c("ATG", "CTG", "TTG", "GTG", "ATA", "ATC", "ATT",
+                     "AAG", "ACG", "AGG", "other")
+
+# only genes that have these many counts across all samples
+count_threshold_for_deseq2 <- 100
+# set the lowest counts to be these for DESeq2 fold-changes
+deseq2_floor <- 1
+```
+
+## Read hg38 genome and Gencode annotations
+```{r}
+genome <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+annotations <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/human/hg38/gencode/annotations/gencode.v24.annotation.gff3.gz")
+annotations <- rtracklayer::import.gff3(annotations)
+```
+
+## Extract gene annotations 
+```{r, message=F}
+gene_annotations <- annotations %>% 
+  filter(type == "gene") %>% 
+  tidy() %>% 
+  print()
+```
+
+## Read in gene counts and convert it to col
+```{r}
+counts <- list.files("../processeddata/", pattern = "gencode.genes.results",
+                          recursive = T,
+                          full.names = T) %>% 
+  enframe("sno", "file") %>% 
+  mutate(sample = str_extract(file, "[^/]+(?=/gencode.genes.results)")) %>% 
+  mutate(data = map(file, data.table::fread)) %>% 
+  unnest(data) %>% 
+  select(-sno, -file, -length, -effective_length, -TPM, -FPKM, -`transcript_id(s)`) %>% 
+  mutate(expected_count = as.integer(expected_count)) %>% 
+  filter(expected_count > 0) %>% 
+  complete(sample, gene_id, fill = list("expected_count" = deseq2_floor)) %>% 
+  group_by(sample) %>% 
+  mutate(sumcount = sum(expected_count)) %>% 
+  ungroup() %>% 
+  filter(sumcount > count_threshold_for_deseq2) %>% 
+  select(-sumcount)
+
+gene_counts <- counts %>% 
+  spread(sample, expected_count) %>% 
+  as.data.frame() %>% 
+  column_to_rownames("gene_id")
+
+head(gene_counts)
+```
+
+## Run DESeq2 to get log fold changes
+```{r}
+coldata <- colnames(gene_counts) %>% 
+  enframe("sno", "sample") %>% 
+  mutate(colname = sample) %>% 
+  as.data.frame() %>% 
+  column_to_rownames("colname") %>% 
+  select(-sno)
+
+ddsObject <- DESeq2::DESeqDataSetFromMatrix(countData = gene_counts,
+                                            colData = coldata, design = ~ sample)
+
+dds <- DESeq2::DESeq(ddsObject)
+```
+
+## Get fold-changes between specific sample pairs
+
+The sample pairs were created manually in `../annotations/samplepairs_for_deseq2.org`
+and exported to `../annotations/samplepairs_for_deseq2.tsv`
+
+```{r}
+lfc <- read_tsv("../annotations/samplepairs_for_deseq2.tsv") %>% 
+  mutate(deseq_results = map2(sample1, sample2, function(x, y) 
+    DESeq2::results(dds, contrast = c("sample", x, y)))) %>%
+  mutate(lfc = map(deseq_results, function(res) 
+    res['log2FoldChange'] %>% as.data.frame() %>% rownames_to_column("gene_id"))) %>% 
+  select(-deseq_results) %>% 
+  unnest() %>% 
+  left_join(counts, by = c("sample1" = "sample", "gene_id")) %>% 
+  rename(count1 = expected_count) %>% 
+  left_join(counts, by = c("sample2" = "sample", "gene_id")) %>% 
+  rename(count2 = expected_count) %>% 
+  print()
+```
+
+## Get list of inferferon-induced genes (Ribo)
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "(cyclo|mrna)_ifn$") & 
+           str_detect(sample2, "(cyclo|mrna)_untr")) %>% 
+  mutate(treatment = str_extract(sample1, "mrna|cyclo|ltm")) %>% 
+  mutate(sample1 = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample2 = str_extract(sample2, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(lfc = log2FoldChange) %>% 
+  select(-gene_id, -gene_type) %>% 
+  gather(qty, value, matches("lfc|count1|count2")) %>% 
+  unite(qty, treatment, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(sample1, sample2, qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(cyclo_lfc)) %>% 
+  write_tsv("../tables/interferon_induced_genes.tsv") %>% 
+  print()
+```
+
+## Get list of virus-induced genes (Ribo)
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "(cyclo|mrna)_vir$") & 
+           str_detect(sample2, "(cyclo|mrna)_untr")) %>% 
+  mutate(treatment = str_extract(sample1, "mrna|cyclo|ltm")) %>% 
+  mutate(sample1 = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample2 = str_extract(sample2, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(lfc = log2FoldChange) %>% 
+  select(-gene_id, -gene_type) %>% 
+  gather(qty, value, matches("lfc|count1|count2")) %>% 
+  unite(qty, treatment, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(sample1, sample2, qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(cyclo_lfc)) %>% 
+  write_tsv("../tables/virus_induced_genes.tsv") %>% 
+  print()
+```
+
+## Get list of inferferon + virus induced genes (Ribo)
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "(cyclo|mrna)_ifn_vir$") & 
+           str_detect(sample2, "(cyclo|mrna)_untr")) %>% 
+  mutate(treatment = str_extract(sample1, "mrna|cyclo|ltm")) %>% 
+  mutate(sample1 = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample2 = str_extract(sample2, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(lfc = log2FoldChange) %>% 
+  select(-gene_id, -gene_type) %>% 
+  gather(qty, value, matches("lfc|count1|count2")) %>% 
+  unite(qty, treatment, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(sample1, sample2, qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(cyclo_lfc)) %>% 
+  write_tsv("../tables/interferon_plus_virus_induced_genes.tsv") %>% 
+  print()
+```
+
+## Genes with largest TE difference between interferon and untreated conditions
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "cyclo_(ifn|untr)$") & 
+           str_detect(sample2, "mrna_(ifn|untr)$")) %>% 
+  mutate(sample = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(te = log2FoldChange) %>% 
+  select(-gene_id, -gene_type, -sample1, -sample2) %>% 
+  gather(qty, value, matches("te|count1|count2")) %>% 
+  unite(qty, sample, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(ifn_te - untr_te)) %>%
+  write_tsv("../tables/interferon_treatment_te_change.tsv") %>% 
+  print()
+```
+
+## Genes with largest TE difference between virus and untreated conditions
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "cyclo_(vir|untr)$") & 
+           str_detect(sample2, "mrna_(vir|untr)$")) %>% 
+  mutate(sample = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(te = log2FoldChange) %>% 
+  select(-gene_id, -gene_type, -sample1, -sample2) %>% 
+  gather(qty, value, matches("te|count1|count2")) %>% 
+  unite(qty, sample, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(vir_te - untr_te)) %>%
+  write_tsv("../tables/virus_treatment_te_change.tsv") %>% 
+  print()
+```
+
+## Genes with largest TE difference between interferon + virus and untreated conditions
+```{r}
+lfc %>% 
+  filter(str_detect(sample1, "cyclo_(ifn_vir|untr)$") & 
+           str_detect(sample2, "mrna_(ifn_vir|untr)$")) %>% 
+  mutate(sample = str_extract(sample1, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  left_join(gene_annotations %>% select(gene_id, gene_name, gene_type)) %>% 
+  filter(gene_type == "protein_coding") %>% 
+  rename(te = log2FoldChange) %>% 
+  select(-gene_id, -gene_type, -sample1, -sample2) %>% 
+  gather(qty, value, matches("te|count1|count2")) %>% 
+  unite(qty, sample, qty) %>% 
+  # get rid of second copy of genes present in both x and y
+  group_by(qty, gene_name) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  spread(qty, value) %>%
+  # include only genes with > threshold counts across these subst conditions
+  filter(rowSums(select(., matches("count(1|2)$"))) > count_threshold_for_deseq2) %>% 
+  arrange(desc(ifn_vir_te - untr_te)) %>%
+  write_tsv("../tables/interferon_plus_virus_treatment_te_change.tsv") %>% 
+  print()
+```

@@ -1,0 +1,388 @@
+---
+title: "Plot coverage around annotated starts"
+author: "`r Sys.info()[['user']]`"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import libraries
+```{r, message=F}
+# genome sequence
+library(BSgenome.Hsapiens.UCSC.hg38)
+# for working with annotations
+library(GenomicFeatures)
+# for working with bam files
+library(GenomicAlignments)
+# read/write gff3 files
+library(rtracklayer)
+# for tab-data manipulations
+library(tidyverse)
+# for easy string concatentation
+library(glue)
+# for converting bioconductor objects to tidyverse
+library(biobroom)
+# for using tidyverse on bioconductor objects
+library(plyranges)
+```
+
+## Analysis specific parameters
+```{r}
+sample_names <- c(
+  "vir" = "+vir",
+  "ifn_vir" = "+ifn +vir",
+  "untr" = "ctrl",
+  "ifn" = "+ifn"
+)
+
+treatment_names <- c(
+  "cyclo" = "ribo",
+  "ltm" = "ribo + LTM",
+  "mrna" = "mRNA"
+)
+
+min.read.density <- 0.33  # reads / nt, only cds above this used for codon density
+left_overhang_for_start_profile <- 50
+right_overhang_for_start_profile <- 100
+
+left_overhang_for_stop_profile <- 100
+right_overhang_for_stop_profile <- 50
+
+```
+
+## Plotting defaults
+```{r, message=F}
+# color blind palette
+# http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/#a-colorblind-friendly-palette
+cbPalette <- c("#666666", "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", 
+    "#D55E00", "#F0E442")
+
+theme_set(theme_classic(base_family = "Helvetica", base_size = 8) +
+theme(          
+  strip.background = element_blank(),
+  legend.text = element_text(size = 8),
+  strip.text.x = element_text(size = 8),
+  axis.line = element_line(size=.25),
+  plot.title = element_text(size = 8, hjust = 0.5)
+))
+```
+
+## Read in genome and annotations
+```{r}
+genome <- BSgenome.Hsapiens.UCSC.hg38
+canonical <- import.gff3(glue(
+  '/fh/fast/subramaniam_a/db/rasi/genomes/human/hg38/gencode/',
+  'annotations/',
+  'gencode.v24.canonical_ccds_transcripts.20170315.gff3.gz'))
+
+tx <- canonical %>% 
+  filter(type == "exon") %>% 
+  split(.$transcript_id) 
+
+cds <- canonical %>% 
+  filter(type == "CDS") %>% 
+  split(.$transcript_id) 
+
+tx_annotations <- tx %>% 
+  unlist() %>% 
+  tidy() %>% 
+  group_by(transcript_id) %>% 
+  summarize(tx_length = sum(width)) 
+
+cds_annotations <- canonical[canonical$type == "CDS"] %>% 
+  tidy() %>% 
+  group_by(transcript_id) %>% 
+  summarize(cds_length = sum(width), gene_id = first(gene_id), gene_name = first(gene_name)) %>% 
+  left_join(tx_annotations, by = "transcript_id") %>% 
+  print()
+```
+
+
+## Get list of all annotated starts
+```{r, warning=F, message=F, echo=F}
+starts <- canonical %>% 
+  filter(type == "start_codon") %>% 
+  # map to transcriptomic coordinates
+  GenomicFeatures::mapToTranscripts(tx) %>% 
+  # set strand to be positive since we are in transcript coords
+  mutate(strand = "+")
+
+
+starts <- starts %>% 
+  # extend to either side for plotting profile
+  # note that regions outside of transcript boundaries will be automatically
+  # discarded at the inner join with the read density below
+  promoters(upstream = left_overhang_for_start_profile, 
+            downstream = right_overhang_for_start_profile) %>% 
+  tidy() %>%
+  # create a sequence from start to stop for each range
+  mutate(pos = map2(start, end, function(x, y) seq(from = x, to = y))) %>%
+  # expand each range to equal its length
+  unnest()  %>%
+  mutate(loc = pos - start) %>%
+  # mutate and unnest to create a single pos for each location
+  mutate(start = pos, end = pos) %>%
+  select(start, end, seqname, loc) %>%
+  left_join(select(cds_annotations, transcript_id, gene_name), by = c("seqname" = "transcript_id")) %>% 
+  print()
+```
+
+## Get canonical start tx coord for identifying frame below
+```{r}
+starts_tx <- canonical %>% 
+  filter(type == "start_codon") %>% 
+  tidy() %>% 
+  mutate(end = if_else(strand == "+", start, end)) %>%
+  mutate(start = if_else(strand == "-", end, start)) %>%
+  select(seqname, start, end, strand) %>% 
+  GRanges() %>% 
+  mapToTranscripts(tx) %>%
+  tidy() %>% 
+  group_by(xHits) %>% 
+  arrange(start) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(cds.start = start) %>% 
+  select(cds.start, seqname) %>% 
+  print()
+```
+
+
+## Get list of all annotated stops
+```{r, results="hide", warning=F}
+stops <- canonical %>% 
+  filter(type == "stop_codon") %>% 
+  # map to transcriptomic coordinates
+  GenomicFeatures::mapToTranscripts(tx)
+
+# set strand to be + since we are now in tx space
+strand(stops) <- "+"
+
+stops <- stops %>% 
+  # extend to either side for plotting profile
+  # note that regions outside of transcript boundaries will be automatically
+  # discarded at the inner join with the read density below
+  promoters(upstream = left_overhang_for_stop_profile, 
+            downstream = right_overhang_for_stop_profile) %>% 
+  tidy() %>% 
+  # create a sequence from start to stop for each range
+  mutate(pos = map2(start, end, function(x, y) seq(from = x, to = y))) %>% 
+  # expand each range to equal its length
+  unnest()  %>% 
+  mutate(loc = pos - start) %>% 
+  # mutate and unnest to create a single pos for each location
+  mutate(start = pos, end = pos) %>% 
+  select(start, end, seqname, loc) %>% 
+  print()
+```
+
+## Read in coverage
+```{r}
+cvg <- list.files("../coverage", full.names = T, recursive = T) %>% 
+  # get covearge file
+  str_subset("gencode.+tsv.gz$") %>% 
+  # extract samplename from filename
+  setNames(str_extract(., "[^/\\.]+(?=\\.gencode)")) %>% 
+  enframe("sample", "file") %>%
+  # exclude deblurred or pooled samples
+  filter(!str_detect(file, "deblurred|pooled")) %>% 
+  mutate(data = map(file, function(x) suppressMessages(read_tsv(x)))) %>%
+  select(-file) %>%
+  unnest() %>%
+  mutate(sample = as.factor(sample)) %>%
+  GRanges() %>%
+  print()
+```
+
+```{r}
+cds_counts <- mapToTranscripts(cvg, cds) %>% 
+  mutate(score = cvg$score[xHits], sample = cvg$sample[xHits]) %>% 
+  tidy() %>% 
+  group_by(sample, seqname) %>%
+  summarize(cds_counts = sum(score * width)) %>% 
+  ungroup() %>%
+  left_join(select(cds_annotations, transcript_id, cds_length),
+            by = c("seqname" = "transcript_id")) %>% 
+  mutate(avg_read_density = cds_counts / cds_length) %>% 
+  # select(sample, seqname, avg_read_density) %>% 
+  arrange(desc(avg_read_density)) %>% 
+  print()
+
+```
+
+## Convert coverage to transcriptome coordinates and normalize by mean ORF density
+```{r}
+# go to tx coords
+cvg_tx <- mapToTranscripts(cvg, tx)
+cvg_tx$score  <- cvg$score[cvg_tx$xHits]
+cvg_tx$sample <- cvg$sample[cvg_tx$xHits]
+
+### Thresolding and normalization
+# normalize each read by the average read density / nt in the cds region of each transcript
+normalized_density <- cvg_tx %>% 
+  tidy() %>% 
+  filter(score > 0) %>% 
+  left_join(cds_counts, by = c("seqname", "sample")) %>% 
+  mutate(norm_density = score / avg_read_density)  %>% 
+  filter(avg_read_density > min.read.density) %>% 
+  # convert each range of length > 1 to a sequence of ranges of length 1
+  mutate(pos = map2(start, end, function(x, y) seq(x, y)))  %>% 
+  unnest() %>% 
+  mutate(start = pos, end = pos) %>% 
+  select(-pos) %>% 
+  print()
+```
+
+
+## Calculate read density in each frame
+```{r}
+frame_density <- normalized_density %>% 
+  inner_join(starts_tx, by = "seqname") %>% 
+  mutate(frame = (start - cds.start) %% 3) %>% 
+  # divide by cds length to account for zero count positions
+  mutate(frame_density = norm_density / cds_length) %>% 
+  group_by(sample, frame) %>% 
+  # the sum here takes care of weighin down the zero count positions
+  summarize(frame_density = sum(frame_density)) %>% 
+  ungroup() %>% 
+  # normalize
+  group_by(sample) %>% 
+  mutate(frame_density = frame_density / sum(frame_density) * 100) %>% 
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  write_tsv(glue('../tables/frame_density_host.tsv.gz'))
+  
+```
+
+## Plot density in each frame
+```{r, fig.width = 3.6, fig.height = 1.8}
+frame_density %>% 
+  ggplot(aes(x = frame, y = frame_density, color = treatment)) +
+  facet_wrap(~sample, ncol = 4, scales = "free") +
+  geom_line(size = 0.5) + geom_point() +
+  labs(x = "frame", 
+       y = "normalized read density (%)",
+       color = "") +
+  scale_color_manual(values = cbPalette) +
+  scale_x_continuous(breaks = c(0,1,2)) +
+  theme(legend.position = "top", legend.direction = "horizontal")
+
+ggsave(glue('../figures/frame_density_profile_host.pdf'))
+
+```
+
+
+## Plot profile around start codon
+### Calculate profile
+```{r}
+plot_data <- normalized_density %>% 
+  right_join(starts, by = c("seqname", "start", "end")) %>% 
+  # gets rid of positions outside tx boundary
+  filter(start > 0) %>%
+  select(sample, seqname, loc, norm_density) %>%
+  complete(sample, nesting(seqname, loc), fill = list(norm_density = 0)) %>%
+  # at least one position in the window must be greater than 0 in a given sample
+  # (this gets rid of NA sample created in the right_join above)
+  group_by(sample, seqname) %>%
+  filter(sum(norm_density) > 0) %>%
+  ungroup() %>%
+  # adjust location to account for overhang
+  mutate(loc = loc - left_overhang_for_start_profile) %>% 
+  group_by(sample, loc) %>% 
+  # average each location across all genes in each sample
+  summarize(norm_density = mean(norm_density)) %>%
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  write_tsv(glue('../tables/start_codon_profile_host.tsv.gz'))
+```
+
+### Plot profile
+```{r, fig.width=2.85, fig.height=5.6}
+plot_data %>% 
+  filter(loc %in% seq(-20, 30)) %>%
+  ggplot(aes(x = loc, y = norm_density, color = treatment)) +
+  facet_wrap(sample ~ treatment, ncol = 3, scales = "free") +
+  geom_line(size = 0.5) + 
+  labs(x = "distance from start codon (nt)", 
+       y = "normalized read density",
+       color = "") +
+  scale_color_manual(values = cbPalette) +
+  scale_x_continuous(breaks = c(-15, 0, 15, 30)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(legend.position = "top", legend.direction = "horizontal")
+
+ggsave(glue('../figures/start_codon_profile_host.pdf'))
+```
+
+### Same plot as above but expanded to show 3nt periodicity
+```{r, fig.width=2.85, fig.height=5.6}
+plot_data %>% 
+  filter(loc %in% seq(50, 80)) %>%
+  ggplot(aes(x = loc, y = norm_density, color = treatment)) +
+  facet_wrap(sample ~ treatment, ncol = 3, scales = "free") +
+  geom_line(size = 0.5) + 
+  labs(x = "distance from start codon (nt)", 
+       y = "normalized read density",
+       color = "") +
+  scale_color_manual(values = cbPalette) +
+  # scale_x_continuous(breaks = c(-15, 0, 15, 30)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(legend.position = "top", legend.direction = "horizontal")
+
+ggsave(glue('../figures/start_codon_profile_host_3nt_periodicity.pdf'))
+```
+## Plot profile around stop codon 
+### Calculate profile
+```{r}
+plot_data <- normalized_density %>% 
+  right_join(stops, by = c("seqname", "start", "end")) %>% 
+  # gets rid of positions outside tx boundary
+  filter(start > 0) %>%
+  select(sample, seqname, loc, norm_density) %>%
+  complete(sample, nesting(seqname, loc), fill = list(norm_density = 0)) %>%
+  # at least one position in the window must be greater than 0 in a given sample
+  # (this gets rid of NA sample created in the right_join above)
+  group_by(sample, seqname) %>%
+  filter(sum(norm_density) > 0) %>%
+  ungroup() %>%
+  # adjust location to account for overhang
+  mutate(loc = loc - left_overhang_for_stop_profile) %>% 
+  group_by(sample, loc) %>% 
+  # average each location across all genes in each sample
+  summarize(norm_density = mean(norm_density)) %>%
+  ungroup() %>% 
+  mutate(treatment = str_extract(sample, "mrna|cyclo|ltm")) %>% 
+  mutate(sample = str_extract(sample, "(?<=(mrna|cyclo|ltm)_).+")) %>% 
+  mutate(sample = forcats::fct_rev(sample_names[sample]), 
+         treatment = treatment_names[treatment]) %>% 
+  write_tsv(glue('../tables/stop_codon_profile_host.tsv.gz'))
+```
+
+### Plot profile
+```{r, fig.width=2.85, fig.height=5.6}
+plot_data %>% 
+  filter(loc %in% seq(-30, 20)) %>%
+  ggplot(aes(x = loc, y = norm_density, color = treatment)) +
+  facet_wrap(sample ~ treatment, ncol = 3, scales = "free") +
+  geom_line(size = 0.5) + 
+  labs(x = "distance from stop codon (nt)", 
+       y = "normalized read density",
+       color = "") +
+  scale_color_manual(values = cbPalette) +
+  scale_x_continuous(breaks = c(-30, -15, 0, 15)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(legend.position = "top", legend.direction = "horizontal")
+
+ggsave(glue('../figures/stop_codon_profile_host.pdf'))
+```
