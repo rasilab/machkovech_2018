@@ -1,10 +1,10 @@
 """Redesigns influenza genes to add / remove alternative start motifs.
 
 First removes CTG, ATG, GTG motifs from all reading frames as best as possible.
-These sequences are denoted as "lowAS" because this is supposed to remove
+These sequences are denoted as "lowCTG" because this is supposed to remove
 alternative start sites.
 
-Then adds CTG motifs in reading frame 1 of the PR8-NP-lowAS sequence to
+Then adds CTG motifs in reading frame 1 of the PR8-NP-lowCTG sequence to
 create PR8-NP-highCTG motif. This sequence should have lots of alternative
 starts in the first reading from.
 
@@ -13,7 +13,8 @@ new codons that are introduced are chosen to be as frequent as possible in
 natural existing sequences, and must exist in at least a threshold number 
 of sequences.
 
-Jesse Bloom, 2012."""
+Jesse Bloom, 2012. 
+Edited by Heather Machkovech, 2018"""
 
 
 import os
@@ -159,24 +160,13 @@ def main():
     outdir = 'redesigned_sequences' # output directory
     remove_targets = { # targets for removing motifs
      # name : (out name, sequence file, comparison file, codonmotifs)
-        'PR8-PB2' : ('PR8-PB2-lowAS', 'sequences/PR8-PB2-cDNA.fasta', 'comparison_sequence_sets/PB2_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-PB1' : ('PR8-PB1-lowAS', 'sequences/PR8-PB1-cDNA.fasta', 'comparison_sequence_sets/PB1_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-PA' : ('PR8-PA-lowAS', 'sequences/PR8-PA-cDNA.fasta', 'comparison_sequence_sets/PA_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-HA' : ('PR8-HA-lowAS', 'sequences/PR8-HA-cDNA.fasta', 'comparison_sequence_sets/H1_HA_PR8_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'CA09-HA-T197A' : ('CA09-HA-T197A-lowAS', 'sequences/CA09-HA-T197A-cDNA.fasta', 'comparison_sequence_sets/H1_HA_CA09-T197A_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'X31-HA' : ('X31-HA-lowAS', 'sequences/X31-HA-cDNA.fasta', 'comparison_sequence_sets/H3_HA_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-NP' : ('PR8-NP-lowAS', 'sequences/PR8-NP-cDNA.fasta', 'comparison_sequence_sets/NP_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-NA' : ('PR8-NA-lowAS', 'sequences/PR8-NA-cDNA.fasta', 'comparison_sequence_sets/N1_NA_PR8_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'CA09-NA' : ('CA09-NA-lowAS', 'sequences/CA09-NA-cDNA.fasta', 'comparison_sequence_sets/N1_NA_CA09_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'X31-NA' : ('X31-NA-lowAS', 'sequences/X31-NA-cDNA.fasta', 'comparison_sequence_sets/N2_NA_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-M1' : ('PR8-M1-lowAS', 'sequences/PR8-M1-cDNA.fasta', 'comparison_sequence_sets/M1_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-M2' : ('PR8-M2-lowAS', 'sequences/PR8-M2-cDNA.fasta', 'comparison_sequence_sets/M2_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-NS1' : ('PR8-NS1-lowAS', 'sequences/PR8-NS1-cDNA.fasta', 'comparison_sequence_sets/NS1_aligned.fasta', ['GTG', 'ATG', 'CTG']),
-        'PR8-NS2' : ('PR8-NS2-lowAS', 'sequences/PR8-NS2-cDNA.fasta', 'comparison_sequence_sets/NS2_aligned.fasta', ['GTG', 'ATG', 'CTG']),
+       
+        'PR8-NP' : ('PR8-NP-lowCTG', 'sequences/PR8-NP-cDNA.fasta', 'comparison_sequence_sets/NP_aligned.fasta', ['GTG', 'ATG', 'CTG'])
+        
     }
     addctg_targets = { # targets for adding CTG motifs in frame 1
      # name : (out name, sequence file, comparison file)
-        'PR8-NP-lowAS' : ('PR8-NP-highCTG', '%s/PR8-NP-lowAS.fasta' % outdir, 'comparison_sequence_sets/NP_aligned.fasta'),
+        'PR8-NP-lowCTG' : ('PR8-NP-highCTG', '%s/PR8-NP-lowCTG.fasta' % outdir, 'comparison_sequence_sets/NP_aligned.fasta'),
     }
     count_threshold = 100 # any new codons introduced must be found naturally in at least this many sequences
     spliced_segments = [
@@ -264,8 +254,8 @@ def main():
         fasta.Write([(header, seq)], outfile)
     # write full alternatively spliced segment coding regions
     for (name, g1, g1_start, g1_end, g2, g2e1_start, g2e1_end, g2e2_start, g2e2_end) in spliced_segments:
-        outname = "%s-lowAS" % name
-        (g1name, g2name) = ('%s-lowAS' % g1, '%s-lowAS' % g2)        
+        outname = "%s-lowCTG" % name
+        (g1name, g2name) = ('%s-lowCTG' % g1, '%s-lowCTG' % g2)        
         g1_file = '%s/%s.fasta' % (outdir, g1name)
         g2_file = '%s/%s.fasta' % (outdir, g2name)
         outfile = "%s/%s.fasta" % (outdir, outname)

@@ -79,3 +79,39 @@ rmarkdown::render('analyze_host_called_start_sites.Rmd')
 rmarkdown::render('plot_flu_called_start_stats.Rmd')
 rmarkdown::render('plot_host_called_start_stats.Rmd')
 #+END_SRC
+
+** Plot NP322 supplemental figures
+#+BEGIN_SRC sh :exports code
+NP_highCTG_supp_figs.ipynb
+#+END_SRC
+
+** Plot NA43 codon conservation, activity assays, and viral titers
+#+BEGIN_SRC sh :exports code
+NA43_activity_expression_codoncons_and_viraltiters.ipynb
+#+END_SRC
+
+** Analyze and plot NA43 viral competition assays
+#+BEGIN_SRC sh :exports code
+NA43_competition.ipynb
+#+END_SRC
+
+** Influenza CTG evolution
+
+*** Parse and align influenza sequences
+#+BEGIN_SRC sh :exports code
+python get_human_seqs.py 
+python get_humanH5N1_seqs.py
+python get_classical_swine_seqs.py
+python get_avian_seqs.py
+#+END_SRC
+
+*** Plot influenza CTG evolution
+#+BEGIN_SRC sh :exports code
+Influenza_CTG_evolution.ipynb
+#+END_SRC
+
+** Generate low and high CTG PR8 NP sequences
+#+BEGIN_SRC sh :exports code
+python redesign_sequences.py
+#+END_SRC
+
