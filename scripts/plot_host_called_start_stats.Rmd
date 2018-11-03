@@ -1,5 +1,5 @@
 ---
-title: "Plot figures for host starts"
+title: "Statistics of called host start sites"
 author: "`r Sys.info()[['user']]`"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
@@ -7,53 +7,22 @@ output:
     toc: yes
 ---
 
+In this notebook, we look at different statistics of host called start sites such
+as the proportion of uTIS/dTIS vs aTIS and non-AUG vs AUG TIS.
+
+We do these analysis for all genes as well as the genes that are induced upon
+treatment with interferon, influenza virus, or both.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
 ```
 
-## Notes for paper
-- Mention that the overrepresentation of near-cognate start codons in uTIS compared to dTIS could come either because of technical reasons (see recent Mol cell paper by Dever and also Gao et al 2015) or because near cognate initiation is more favored near the 5' end of the message.
-
-- Among the TIS whose LTM counts increase upon a treatment (+ifn or +vir), there can be 3 classes:
-
-     1. TIS that increase just because their mRNA and Ribo-Seq levels increase. These are not interesting.
-     2. TIS that increase, but their mRNA and Ribo-Seq levels change discordantly. These TIS might be involved in translational regulation.
-     3. TIS that increase, but neither mRNA nor Ribo-Seq levels change. These TIS might have new functions, but without changing the total expression from the full gene.
-     
-     The 2. and 3. classes are interesting, and we need to see if any such exist in our dataset upon +ifn / +vir / +ifn+vir treatment.
-   
-- Mention the caveat that several downstream and upstream in-frame TIS could just be misannotated TIS.
-
-- Mention that you did not confine your TIS to the first 1/3 of the transcript. You also just used the canonical start as the aTIS
-
-## Import libraries
+# Import libraries and define analysis specific variables
 ```{r}
-# for handling htseq alignments
-library(GenomicAlignments)
-# for handling genomic annotations
-library(GenomicFeatures)
-# for string concatenation
-library(glue)
-# for string analysis
-library(stringr)
-# low level graphics
-library(grid)
-# for venn diagrams
-library(VennDiagram)
-# for sequence logo plots
-library(ggseqlogo)
-# for reading and writing genomic files
-library(rtracklayer)
-# for converting between bioconductor and tidyverse
-library(biobroom)
-# for biconductor tidyverse interface
-library(plyranges)
-# for munging data
 library(tidyverse)
-# for venn diagrams
-library(VennDiagram)
 library(rasilabRtemplates)
 
+# use this for labeling axis ticks
 sample_names <- c(
   "vir" = "+vir",
   "ifn_vir" = "+ifn +vir",
@@ -69,19 +38,14 @@ sample_numbers <- c(
   "ifn" = 1
 )
 
-treatment_names <- c(
-  "cyclo" = "ribo",
-  "ltm" = "ribo + LTM",
-  "mrna" = "mRNA"
-)
-
-# use this order to resolve multiple TIS within the same 5nt window
+# use this order to resolve multiple TIS within the same 5nt window and
+# also to order codons during plotting
 tis_priority <- seq(11)
 names(tis_priority) <- c("AUG", "CUG", "GUG", "UUG", "AUA", "AUC", "AUU",
                      "AAG", "ACG", "AGG", "other")
 ```
 
-## Read in called starts from our data and analysis of Lee PNAS 2012 data
+# Read in called starts from our data and analysis of Lee PNAS 2012 data
 ```{r}
 tis <- read_tsv("../tables/called_host_tis.tsv") %>% 
   mutate_at(vars(ends_with("_p")), funs(as.numeric)) %>% 
@@ -101,7 +65,7 @@ lee_2012_tis <- read_tsv("../tables/lee_2012_called_host_tis.tsv") %>%
 ```
 
 
-## Get combination of samples that each start occurs in
+# Get combination of samples that each start occurs in
 ```{r}
 tis_combo <- tis %>% 
   # get rid of peaks that coincide with the same start on canonical tx
@@ -122,7 +86,7 @@ tis_combo <- tis %>%
   print()
 ```
 
-## Create combo with chromosome annotations for joining with unfiltered starts later
+# Create combo with chromosome annotations for joining with unfiltered starts later
 ```{r}
 tis_combo_with_chr <- tis_combo %>% 
   right_join(tis %>% select(codon, nt_to_atis, gene_name, sample, chr, chr.start),
@@ -130,7 +94,7 @@ tis_combo_with_chr <- tis_combo %>%
   print()
 ```
 
-## Get combination of samples that each start occurs in Lee 2012
+# Get combination of samples that each start occurs in Lee 2012
 ```{r}
 lee_2012_tis_combo <- lee_2012_tis %>% 
   # get rid of peaks that coincide with the same start on canonical tx
@@ -152,7 +116,7 @@ lee_2012_tis_combo <- lee_2012_tis %>%
 ```
 
 
-## Plot the proportion of TIS that are called in certain number of samples 
+# Plot the proportion of TIS that are called in certain number of samples 
 ```{r, fig.width=1.6, fig.height=1.2}
 tis_combo %>% 
   group_by(nsamples) %>% 
@@ -166,20 +130,21 @@ ggsave('../figures/tis_vs_nsamples_host.pdf',
        units = 'in')
 ```
 
-## Distinct sample combinations for called TIS
+# Distinct sample combinations for called TIS
 ```{r}
 distinct(tis_combo, combo, n, combo_num) %>% 
-  arrange(desc(combo_num))
+  arrange(desc(combo_num)) %>% 
+  knitr::kable()
 ```
 
-## TIS common to all samples
+# TIS common to all samples
 ```{r}
 common_starts <- tis_combo %>% 
   filter(nsamples == 4) %>% 
   print()
 ```
 
-## Plot overlap in called TIS between our high cofidence set and Lee 2012 high  confidence set
+# Plot overlap in called TIS between our high cofidence set and Lee 2012 high confidence set
 
 ```{r, fig.width=2, fig.height=2}
 list1 <- common_starts %>% 
@@ -206,7 +171,7 @@ tis_overlap_with_lee <- bind_rows(list1, list2) %>%
   print()
   
 
-p <- draw.pairwise.venn(
+p <- VennDiagram::draw.pairwise.venn(
   tis_overlap_with_lee[['this', 'n']] + tis_overlap_with_lee[['this:lee', 'n']] ,
   tis_overlap_with_lee[['lee', 'n']] + tis_overlap_with_lee[['this:lee', 'n']], 
   tis_overlap_with_lee[['this:lee', 'n']], 
@@ -219,9 +184,7 @@ ggsave("../figures/overlap_between_us_lee_2012.pdf", plot = p)
 
 ```
 
-
-
-## Proportion of uTIS, aTIS, dTIS among common_starts
+# Proportion of uTIS, aTIS, dTIS among common_starts
 ```{r, fig.width=1.6, fig.height=1.2}
 plot_data <- common_starts %>% 
   group_by(tis.type) %>% 
@@ -250,9 +213,7 @@ plot_data %>%
 ggsave('../figures/atis_vs_dtis_proportion_host.pdf', 
        units = 'in')
 ```
-
-
-## Proportion of different codons in aTIS and dTIS for common starts
+# Proportion of different codons in aTIS and dTIS for common starts
 
 ```{r, fig.width=2.8, fig.height=1.6}
 plot_data <- common_starts %>% 
@@ -281,26 +242,21 @@ ggsave('../figures/codon_proportion_host_tis.pdf',
        units = 'in')
 ```
 
-## Proportion of different TIS types among genes that are induced upon treatment with virus / interferon / both
+# Get genes that are induced upon variout treatments.
 
+These are calculated in <analyze_host_fold_changes.md>.
 ```{r}
-gene_lfc <- list.files("../tables/", pattern = "induced_genes.tsv", full.names = T) %>% 
+induced_genes <- list.files("../tables/", pattern = "induced_genes.tsv", 
+                            full.names = T) %>% 
   enframe("sno", "file") %>% 
   mutate(data = map(file, read_tsv)) %>% 
   unnest() %>% 
-  select(-sno, -file, -sample2) %>% 
-  rename(sample = sample1) %>% 
+  select(-sno, -file, -treatment2) %>% 
+  rename(sample = treatment1, gene_name = symbol) %>% 
   print()
 ```
 
-## Select only induced genes (avg 2-fold between cyclo and mRNA)
-```{r}
-induced_genes <- gene_lfc %>% 
-  filter(cyclo_lfc + mrna_lfc > 2 * log2(2) ) %>% 
-  print()
-```
-
-## Plot number of induced genes in each sample
+# Plot number of induced genes in each sample
 
 ```{r, fig.width=1.8, fig.height=1.6}
 plot_data <- induced_genes %>% 
@@ -322,32 +278,31 @@ Plot overlap between genes induced in +ifn and +ifn+vir sample
 ```{r, fig.width=1.2, fig.height=1.2}
 gene_overlap_ifn_samples <- induced_genes %>% 
   filter(str_detect(sample, "ifn")) %>% 
-  group_by(gene_name) %>% 
+  group_by(gene_id) %>% 
   mutate(nsamples = n()) %>% 
   mutate(combo = paste0(as.character(sample), collapse = ":")) %>% 
+  slice(1) %>% 
   ungroup() %>% 
-  select(-sample) %>% 
-  distinct() %>% 
   group_by(combo) %>% 
   dplyr::count() %>% 
   ungroup() %>% 
-  as.data.frame() %>% 
-  column_to_rownames("combo") %>% 
+  as.data.frame() %>%
+  column_to_rownames("combo") %>%
   print()
 
-p <- draw.pairwise.venn(
+p <- VennDiagram::draw.pairwise.venn(
   gene_overlap_ifn_samples[['ifn', 'n']] + gene_overlap_ifn_samples[['ifn:ifn_vir', 'n']] ,
-  gene_overlap_ifn_samples[['ifn_vir', 'n']] + gene_overlap_ifn_samples[['ifn:ifn_vir', 'n']], 
-  gene_overlap_ifn_samples[['ifn:ifn_vir', 'n']], 
-  category = c("+ifn", "+ifn+vir"), 
-  fill = "grey", 
+  gene_overlap_ifn_samples[['ifn_vir', 'n']] + gene_overlap_ifn_samples[['ifn:ifn_vir', 'n']],
+  gene_overlap_ifn_samples[['ifn:ifn_vir', 'n']],
+  category = c("+ifn", "+ifn+vir"),
+  fill = "grey",
   cat.pos = c(-40, 30),
   cat.dist = c(0.04,0.04))
 
 ggsave("../figures/induced_gene_overlap_between_two_ifn_samples.pdf", plot = p)
 ```
 
-## Plot the proportion  of different TIS types among induced genes
+# Plot the proportion  of different TIS types among induced genes
 
 ```{r, fig.width=3, fig.height=1.6}
 plot_data <- tis_combo %>% 
@@ -380,9 +335,9 @@ ggsave('../figures/tis_type_induced_genes.pdf',
 ```
 
 
-## Test if uTIS or dTIS initiation is overrepresented among the induced genes in comparison with all genes
+# Test if uTIS or dTIS initiation is overrepresented among the induced genes in comparison with all genes
 
-### First get the number of TIS types in the induced genes
+First get the number of TIS types in the induced genes from the above plot data
 ```{r}
 gene_induction_type_data <- plot_data %>% 
   mutate(tis.type = if_else(tis.type == "aTIS", "aTIS", "altTIS")) %>% 
@@ -391,59 +346,45 @@ gene_induction_type_data <- plot_data %>%
   ungroup() %>% 
   select(sample, tis.type, n) %>% 
   spread(tis.type, n, fill = 0) %>% 
+  data.table::data.table() %>%
+  data.table::setkey(sample) %>% 
   print()
 ```
 
-### Next, combine with the TIS types of all called starts
+Test  for increased altTIS in +ifn induced genes
 ```{r}
-test_data <- tis_combo %>% 
-  filter(codon != "other") %>%
-  mutate(tis.type = if_else(tis.type == "aTIS", "aTIS", "altTIS")) %>% 
-  group_by(tis.type) %>%
-  summarize(n = n()) %>%
-  ungroup() %>%
-  spread(tis.type, n) %>%
-  mutate(sample = "all") %>% 
-  select(sample, everything()) %>% 
-  bind_rows(gene_induction_type_data) %>% 
-  data.table::data.table() %>% 
-  data.table::setkey(sample)
-
-print(test_data)
-```
-
-### Test  for increased altTIS in +ifn induced genes
-```{r}
-data <- test_data[c("+ifn", "all"),c("aTIS", "altTIS")] %>% 
+data <- gene_induction_type_data[c("+ifn", "all"),c("aTIS", "altTIS")] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
 ```
 
-### Test  for increased altTIS in +ifn +vir induced genes
+Test  for increased altTIS in +ifn +vir induced genes
 ```{r}
-data <- test_data[c("+ifn +vir", "all"),c("aTIS", "altTIS")] %>% 
+data <- gene_induction_type_data[c("+ifn +vir", "all"),c("aTIS", "altTIS")] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
 ```
 
-### Test  for increased altTIS in +vir induced genes
+Test for increased altTIS in +vir induced genes
 ```{r}
-data <- test_data[c("+vir", "all"),c("aTIS", "altTIS")] %>% 
+data <- gene_induction_type_data[c("+vir", "all"),c("aTIS", "altTIS")] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
 ```
-## Plot the proportion  of different TIS codons among induced genes
+
+# Plot the proportion  of different TIS codons among induced genes
 
 ```{r, fig.width=3, fig.height=1.6}
 plot_data <- tis_combo %>% 
   inner_join(induced_genes %>% select(sample, gene_name), by = "gene_name") %>% 
   bind_rows(tis_combo) %>% 
+  filter(codon != "other") %>%
   group_by(codon, sample) %>% 
   dplyr::count() %>% 
   mutate(codon_priority = tis_priority[codon]) %>% 
@@ -453,8 +394,7 @@ plot_data <- tis_combo %>%
   group_by(sample) %>%
   mutate(n_prop = n / sum(n) * 100) %>%
   ungroup() %>%
-  mutate(sample = if_else(is.na(sample), "all", sample)) %>% 
-  print(n = 70)
+  mutate(sample = if_else(is.na(sample), "all", sample))
 
 plot_data %>% 
   ggplot(aes(y = n_prop, x = sample, fill = codon)) +
@@ -471,9 +411,9 @@ ggsave('../figures/tis_codon_proportion_induced_genes.pdf',
        units = 'in')
 ```
 
-## Test for increased proportion of non-ATG TIS among induced genes
+# Test for increased proportion of non-AUG TIS among induced genes
 
-### First get the number of TIS codons of different types in the induced genes
+First get the number of TIS codons of different types in the induced genes
 ```{r}
 gene_induction_codon_data <- plot_data %>% 
   mutate(codon = if_else(codon == "AUG", "atg", "nearatg")) %>% 
@@ -481,369 +421,34 @@ gene_induction_codon_data <- plot_data %>%
   summarize(n = sum(n)) %>% 
   ungroup() %>% 
   spread(codon, n, fill = 0) %>% 
-  print()
-```
-### First get the proportion of non-ATG TIS among the high-confidence starts
-```{r}
-test_data <- tis_combo %>% 
-  filter(codon != "other") %>%
-  mutate(codon = if_else(codon == "AUG", "atg", "nearatg")) %>% 
-  group_by(codon) %>%
-  summarize(n = n()) %>%
-  ungroup() %>%
-  spread(codon, n) %>%
-  mutate(sample = "all") %>% 
-  select(sample, everything()) %>% 
-  bind_rows(gene_induction_codon_data) %>% 
   data.table::data.table() %>% 
-  data.table::setkey(sample)
-
-print(test_data)
-```
-
-Do the tests for each treatment below.
-
-### Test  for +ifn
-```{r}
-data <- test_data[c("+ifn", "all"),!"sample"] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-### Test  for +ifn +vir
-```{r}
-data <- test_data[c("+ifn +vir", "all"),!"sample"] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-
-### Test  for +vir
-```{r}
-data <- test_data[c("+vir", "all"),!"sample"] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-
-
-## Read in unfiltered start site params for finding genes with biggest fold-change in LTM counts upon +ifn / +vir / +ifn +vir treatments
-
-```{r}
-unfiltered_tis <- list.files("../tables/", pattern = "unfiltered", full.names = T) %>% 
-  enframe("sno", "file") %>% 
-  mutate(data = map(file, read_tsv)) %>% 
-  select(-sno, -file) %>% 
-  unnest() %>% 
-  print()
-
-```
-
-```{r}
-tis_counts_all_samples <- unfiltered_tis %>% 
-  right_join(tis %>% select(chr, chr.start) %>% distinct(), 
-             by = c("seqname" = "chr", "start" = "chr.start")) %>% 
-  rename(ltm_n = ltm_score, ltm_p = ltm_local_ztnb_pvalue, cyclo_n = cyclo_score) %>% 
-  select(sample, gene_id, start, strand, seqname, gene_name, ltm_n, cyclo_n, ltm_p) %>% 
-  # replace all absence counts by a global count threshold of 4
-  mutate(ltm_n = if_else(ltm_n < 4 | is.na(ltm_n), as.integer(4), ltm_n)) %>% 
-  mutate(cyclo_n = if_else(cyclo_n < 4 | is.na(cyclo_n), as.integer(4), cyclo_n)) %>% 
-  gather(key, value, ltm_n, cyclo_n, ltm_p) %>% 
-  unite(key, sample, key) %>% 
-  spread(key, value)
-```
-
-
-## Calculate log2 fold changes in LTM counts at all TIS for the 3 treatments w.r.t wild-type control
-
-```{r}
-tis_ltm_lfc <- tis_counts_all_samples %>% 
-  # calculate log2 ratio at each tis peak
-  mutate_at(vars(matches("^(vir|ifn).+ltm_n$")), funs(ltm_ratio = log2(. / untr_ltm_n))) %>% 
-  # join other tis annotations such as tis.type, peplength etc.
-  left_join(tis_combo_with_chr %>% select(-gene_name), 
-             by = c("seqname" = "chr", "start" = "chr.start")) %>% 
-  # remove multiple calls for the same TIS due to 1nt offset in peaks in different
-  # samples. For eg. see TAP1
-  group_by(gene_name) %>% 
-  slice(1) %>% 
-  ungroup() %>% 
-  # gather log2 ltm ratios for filtering and plotting below
-  gather(sample, lfc, ends_with("ltm_ratio")) %>%
-  filter(!is.na(lfc)) %>% 
-  # median normalize
-  group_by(sample) %>% 
-  mutate(lfc = lfc - median(lfc)) %>% 
-  ungroup() %>% 
-  mutate(sample = str_extract(sample, "ifn_vir|ifn|vir")) %>% 
-  select(sample, everything()) %>% 
+  data.table::setkey(sample) %>% 
   print()
 ```
 
-## Histogram of LTM count median-normalized log2 fold changes at all called peaks (irrrespective of their sample identity) upon treament
-```{r, fig.height=1.6, fig.width=3.2}
-tis_ltm_lfc %>% 
-  mutate(sample = sample_names[sample]) %>% 
-  ggplot(aes(lfc)) +
-  facet_wrap(~ sample, ncol = 3, scales = "free") +
-  geom_histogram(bins = 50) +
-  geom_vline(xintercept = log2(2), linetype = "dashed") +
-  geom_vline(xintercept = -log2(2), linetype = "dashed") +
-  labs(x = "TIS fold change (log2)", y = "TIS count",
-       subtitle = "Induced TIS: lfc > 1, Repressed TIS: lfc < -1") +
-  scale_x_continuous(breaks = scales::pretty_breaks(n=5))
-
-
-ggsave("../figures/tis_fold_change_histogram.pdf")
-```
-
-## Induced and repressed TIS under different treatments
+Test  for increased near AUG in +ifn induced genes
 ```{r}
-induced_repressed_tis <- tis_ltm_lfc %>% 
-  mutate(tis_induction = case_when(
-    lfc >= 1 ~ "induced",
-    lfc < -1 ~ "repressed",
-    T ~ "others")) %>% 
-  # to prevent confusion with lfc for gene below
-  rename(tis_lfc = lfc) %>% 
-  filter(nt_to_atis <= 500) %>% 
-  filter(!tis_induction == "others") %>% 
-  arrange(frame, gene_name) %>% 
-  # get the gene fold-change for the gene and sample that the TIS belongs to
-  left_join(gene_lfc, by = c("sample", "gene_name")) %>% 
-  mutate(gene_induction = case_when(
-    cyclo_lfc + mrna_lfc > 2 * log2(2) ~ "induced",
-    cyclo_lfc + mrna_lfc < -2 * log2(2) ~ "repressed",
-    T ~ "others"
-  )) %>% 
-  print()
-```
-
-
-## Number of TIS that are induced / repressed under different treatments
-```{r}
-induced_repressed_tis %>% 
-  group_by(sample, tis_induction) %>% 
-  dplyr::count() %>% 
-  ungroup()
-```
-
-## Plot TIS induction / repression vs mRNA / Ribo gene fold-change upon different treatments
-
-```{r, fig.width = 3.5, fig.height = 6.5}
-plot_data <- induced_repressed_tis %>% 
-  gather(treatment, gene_lfc, mrna_lfc, cyclo_lfc) %>% 
-  mutate(treatment = str_extract(treatment, "mrna|cyclo")) %>% 
-  mutate(treatment = treatment_names[treatment]) %>% 
-  mutate(sample = sample_names[sample]) %>% 
-  print()
-  
-plot_data %>%  
-  ggplot(aes(x = tis_lfc, y = gene_lfc)) +
-  facet_wrap(~ tis_induction + treatment + sample, scales = "free", ncol = 3) +
-  # geom_density_2d(color = "grey") +
-  scale_x_continuous(breaks = scales::pretty_breaks(n=3)) +
-  scale_y_continuous(breaks = scales::pretty_breaks(n=4)) +
-  labs(x = "TIS log2 fold-change", y = "gene log2 fold-change") +
-  geom_point(size = 0.1)
-
-ggsave("../figures/tis_lfc_vs_gene_lfc.pdf")
-```
-
-```{r}
-plot_data %>% 
-  filter(!is.na(gene_lfc) & !is.na(tis_lfc)) %>% 
-  group_by(tis_induction, treatment, sample) %>% 
-  summarize(corcoeff = cor(gene_lfc, tis_lfc, method = "pearson")) %>% 
-  ungroup()
-```
-
-## Proportion of different codons among induced / repressed TIS with different treatments
-
-```{r, fig.width=4.2, fig.height=3}
-plot_data <- induced_repressed_tis %>% 
-  group_by(tis_induction, sample, tis.type, codon) %>% 
-  dplyr::count() %>% 
-  ungroup() %>% 
-  group_by(tis_induction, sample, tis.type) %>% 
-  mutate(n_prop = n / sum(n) * 100) %>% 
-  ungroup() %>% 
-  mutate(codon = fct_reorder(codon, tis_priority[codon])) %>% 
-  mutate(sample = sample_names[sample]) %>% 
-  filter(tis_induction == "induced") %>% 
-  print(n = 70)
-  
-plot_data %>% 
-  ggplot(aes(y = n_prop, x = tis.type, fill = codon)) +
-  facet_wrap(~ tis_induction + sample, scales = "free_x") +
-  geom_col() +
-  geom_text(data = plot_data %>% 
-              group_by(tis_induction, sample, tis.type) %>% 
-              mutate(n = paste0("N=", sum(n))) %>% slice(1), y = 95, aes(label = n), size = 2.8) +
-  viridis::scale_fill_viridis(discrete = T, direction = -1) +
-  labs(x = "TIS type", y = "TIS proportion (%)", 
-       fill = "") +
-  guides(fill = guide_legend(keyheight = 0.8)) +
-  theme(legend.position = "bottom")
-
-ggsave('../figures/codon_proportion_induced_repressed_tis.pdf', 
-       units = 'in')
-```
-
-## Test if uTIS or dTIS initiation is overrepresented among the induced TIS
-
-### First get the number of TIS types in the induced TIS
-```{r}
-tis_induction_type_data <- plot_data %>% 
-  filter(codon != "other") %>%
-  group_by(sample, tis.type) %>%
-  summarize(n = sum(n)) %>%
-  ungroup() %>% 
-  spread(tis.type, n) %>% 
-  print()
-```
-
-### Next combine with the TIS types of all starts
-```{r}
-test_data <- tis_combo %>% 
-  filter(codon != "other") %>%
-  group_by(tis.type) %>%
-  summarize(n = n()) %>%
-  ungroup() %>%
-  spread(tis.type, n) %>%
-  mutate(sample = "all") %>% 
-  select(sample, everything()) %>% 
-  bind_rows(tis_induction_type_data) %>% 
-  data.table::data.table() %>% 
-  data.table::setkey(sample)
-
-print(test_data)
-```
-
-### Test  for increased uTIS in +ifn induced TIS
-```{r}
-data <- test_data[c("+ifn", "all"),c("aTIS", "uTIS")] %>% 
+data <- gene_induction_codon_data[c("+ifn", "all"),!"sample"] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
 ```
 
-### Test  for increased dTIS in +ifn induced TIS
+Test  for increased near AUG in +ifn +vir induced genes
 ```{r}
-data <- test_data[c("+ifn", "all"),c("aTIS", "dTIS")] %>% 
+data <- gene_induction_codon_data[c("+ifn +vir", "all"),!"sample"] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
 ```
 
-### Test  for increased uTIS in +ifn +vir induced TIS
+Test  for increased near AUG in +vir induced genes
 ```{r}
-data <- test_data[c("+ifn +vir", "all"),c("aTIS", "uTIS")] %>% 
+data <- gene_induction_codon_data[c("+vir", "all"),!"sample"] %>% 
   as.matrix() 
 
 print(data)
 prop.test(data, alternative = "less")
-```
-
-### Test  for increased dTIS in +ifn induced TIS
-```{r}
-data <- test_data[c("+ifn +vir", "all"),c("aTIS", "dTIS")] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-### Test  for increased uTIS in +vir induced TIS
-```{r}
-data <- test_data[c("+vir", "all"),c("aTIS", "uTIS")] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-### Test  for increased dTIS in +vir induced TIS
-```{r}
-data <- test_data[c("+vir", "all"), c("aTIS", "dTIS")] %>% 
-  as.matrix() 
-
-print(data)
-prop.test(data, alternative = "less")
-```
-
-## Examine dTIS among IFN-induced TIS
-
- - The high count LAP3 is a misannotation or alternate annotation.
- - The high count TAP1 is also a misannotation.
- - The NFKBIE gene has a CTG start that is 122aa shorter at the N-terminus. Seems like a good candidate for novel function but no CHX reads at this location. There are also some reads in the untreated sample.
- - ZNFX1 is an interesting gene. It has an out-of-frame dTIS that produces a 141aa peptide. This gene is also strongly induced (7-8 fold) upon +ifn treatment. It also has high RNA-Seq and Ribo-Seq counts, so unlikely to be a fluke. **This is the only interesting out-of-frame dTIS**
-
-
-```{r}
-induced_repressed_tis %>% 
-  filter(sample == "ifn" & tis_induction == "induced" & tis.type == "dTIS") %>% 
-  select(-matches("_p$|_n$"), -combo_num, -nsamples, -gene_id, -start, -strand, -tis_induction, -sample, -gene_induction) %>% 
-  # select(codon, nt_to_atis, gene_name, combo, pep) %>% 
-  arrange(frame, desc(tis_lfc)) %>% 
-  print()
-```
-
-
-## Examine uTIS among IFN-induced TIS
-
- - PSMB10 is part of the immuno-proteosome and is strongly induced upon IFN treatment. It has an upstream CTG followed by a long region that goes into the main ORF. This might act as some sort of negative regulator to moderate the expression.
- - ADAR has an upstream that also extends into the main ORF. This looks like a clear peak in all samples, but  has high enough counts only in the +ifn sample. Interestingly, there is Ribo-seq counts at this uTIS but not at aTIS.
-
-```{r}
-induced_repressed_tis %>% 
-  filter(sample == "ifn" & tis_induction == "induced" & tis.type == "uTIS") %>% 
-  select(-matches("_p$|_n$"), -combo_num, -nsamples, -gene_id, -start, -strand, -tis_induction, -sample, -gene_induction) %>% 
-  # select(codon, nt_to_atis, gene_name, combo, pep) %>% 
-  arrange(frame, desc(tis_lfc)) %>% 
-  print(n = 63)
-```
-
-## Examine dTIS among virus-induced TIS
-
- - PRPF40A looks like a misannotation
- - **CYC1 seems like a promising candidate. This is  part of the respiratory chain complext**
-```{r}
-induced_repressed_tis %>% 
-  filter(sample == "vir" & tis_induction == "induced" & tis.type == "dTIS" & nt_to_atis <= 500) %>% 
-  select(-matches("_p$|_n$"), -combo_num, -nsamples, -gene_id, -start, -strand, -tis_induction, -sample, -gene_induction) %>% 
-  # select(codon, nt_to_atis, gene_name, combo, pep) %>% 
-  arrange(frame, desc(tis_lfc)) %>% 
-  print()
-```
-
-
-## Examine uTIS among virus-induced TIS
-
-```{r}
-induced_repressed_tis %>% 
-  filter(sample == "vir" & tis_induction == "induced" & tis.type == "uTIS") %>% 
-  select(-matches("_p$|_n$"), -combo_num, -nsamples, -gene_id, -start, -strand, -tis_induction, -sample, -gene_induction) %>% 
-  # select(codon, nt_to_atis, gene_name, combo, pep) %>% 
-  arrange(frame, desc(tis_lfc)) %>% 
-  print(n = 63)
-```
-
-## Examine uTIS among virus-repressed TIS
-
-```{r}
-induced_repressed_tis %>% 
-  filter(sample == "vir" & tis_induction == "repressed" & tis.type == "uTIS") %>% 
-  select(-matches("_p$|_n$"), -combo_num, -nsamples, -gene_id, -start, -strand, -tis_induction, -sample, -gene_induction) %>% 
-  # select(codon, nt_to_atis, gene_name, combo, pep) %>% 
-  arrange(frame, desc(tis_lfc)) %>% 
-  print(n = 76)
 ```
