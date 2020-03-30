@@ -121,10 +121,8 @@ fit_ztnb <- function(score_vector){
 
 ## Read flu genome and annotations
 ```{r, message=FALSE}
-flu_genome_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/",
-                        "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
-flu_annotations_file <- glue("/fh/fast/subramaniam_a/db/rasi/genomes/virus/flu/",
-                             "lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
+flu_genome_file <- glue("/data/influenzaseq/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.fasta")
+flu_annotations_file <- glue("/data/influenzaseq/lowctgnp_wsn_pr8/lowctgnp_wsn_pr8.gtf")
 flu_genome <- Biostrings::readDNAStringSet(flu_genome_file) 
 flu_annotations <- rtracklayer::import.gff2(flu_annotations_file) 
 ```
